@@ -126,6 +126,24 @@
 	};
 
 	const SETTINGS_STORAGE_KEY = 'edgeai-playground:settings:v1';
+	const LAYOUT_STORAGE_KEY = 'edgeai-playground:layout:v1';
+
+	type StoredLayoutV1 = {
+		v: 1;
+		leftSidebarWidth: number;
+		rightSidebarWidth: number;
+	};
+
+	const DESKTOP_BREAKPOINT_PX = 980;
+
+	const LEFT_SIDEBAR_MIN_PX = 240;
+	const LEFT_SIDEBAR_MAX_PX = 520;
+	const RIGHT_SIDEBAR_MIN_PX = 280;
+	const RIGHT_SIDEBAR_MAX_PX = 520;
+	const CENTER_MIN_PX = 360;
+
+	const DEFAULT_LEFT_SIDEBAR_WIDTH_PX = 320;
+	const DEFAULT_RIGHT_SIDEBAR_WIDTH_PX = 320;
 
 	function safeString(v: unknown, fallback: string) {
 		return typeof v === 'string' ? v : fallback;
@@ -192,6 +210,66 @@
 		}
 	}
 
+	function readLayout(): StoredLayoutV1 | null {
+		try {
+			const raw = localStorage.getItem(LAYOUT_STORAGE_KEY);
+			if (!raw) return null;
+			const parsed = JSON.parse(raw) as any;
+			if (!parsed || parsed.v !== 1) return null;
+
+			return {
+				v: 1,
+				leftSidebarWidth: safeNumber(parsed.leftSidebarWidth, DEFAULT_LEFT_SIDEBAR_WIDTH_PX),
+				rightSidebarWidth: safeNumber(parsed.rightSidebarWidth, DEFAULT_RIGHT_SIDEBAR_WIDTH_PX)
+			};
+		} catch {
+			return null;
+		}
+	}
+
+	function writeLayout(layout: StoredLayoutV1) {
+		try {
+			localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(layout));
+		} catch {
+			// localStorage 可能被禁用（隐私模式/策略）
+		}
+	}
+
+	function getViewportWidth() {
+		if (typeof document !== 'undefined') {
+			const w = document.documentElement?.clientWidth;
+			if (typeof w === 'number' && Number.isFinite(w) && w > 0) return w;
+		}
+		return typeof window !== 'undefined' ? window.innerWidth : 0;
+	}
+
+	function clampLayoutToViewport(left: number, right: number) {
+		let l = Math.round(clamp(safeNumber(left, DEFAULT_LEFT_SIDEBAR_WIDTH_PX), LEFT_SIDEBAR_MIN_PX, LEFT_SIDEBAR_MAX_PX));
+		let r = Math.round(clamp(safeNumber(right, DEFAULT_RIGHT_SIDEBAR_WIDTH_PX), RIGHT_SIDEBAR_MIN_PX, RIGHT_SIDEBAR_MAX_PX));
+
+		const vw = getViewportWidth();
+		if (vw <= 0) return { left: l, right: r };
+
+		const center = vw - l - r;
+		if (center >= CENTER_MIN_PX) return { left: l, right: r };
+
+		// 空间不够时：优先压缩右侧栏，再压缩左侧栏
+		let need = CENTER_MIN_PX - center;
+
+		const shrinkRight = Math.min(Math.max(0, r - RIGHT_SIDEBAR_MIN_PX), need);
+		r -= shrinkRight;
+		need -= shrinkRight;
+
+		const shrinkLeft = Math.min(Math.max(0, l - LEFT_SIDEBAR_MIN_PX), need);
+		l -= shrinkLeft;
+
+		return { left: l, right: r };
+	}
+
+	function isDesktopViewport() {
+		return typeof window !== 'undefined' && window.matchMedia(`(min-width: ${DESKTOP_BREAKPOINT_PX + 1}px)`).matches;
+	}
+
 	let provider = $state<Provider>('openai');
 	let baseUrl = $state(DEFAULTS.openai.baseUrl);
 	let apiKey = $state('');
@@ -226,6 +304,9 @@
 	let conversationsOpen = $state(false);
 	let rightPanelTab = $state<DebugTab>('settings');
 	let debugSession = $state<DebugSession | null>(null);
+	let leftSidebarWidth = $state(DEFAULT_LEFT_SIDEBAR_WIDTH_PX);
+	let rightSidebarWidth = $state(DEFAULT_RIGHT_SIDEBAR_WIDTH_PX);
+	let resizingSidebar = $state<null | 'left' | 'right'>(null);
 
 	let showThinking = $state(false);
 	let thinkingAutoExpand = $state(false);
@@ -401,6 +482,62 @@
 	function openConversationsPanel() {
 		conversationsOpen = true;
 		settingsOpen = false;
+	}
+
+	function startSidebarResize(side: 'left' | 'right', e: PointerEvent) {
+		// 仅电脑端启用拖拽（移动端为抽屉式面板）
+		if (!isDesktopViewport()) return;
+		if (e.button !== 0) return;
+
+		const startX = e.clientX;
+		const startLeft = leftSidebarWidth;
+		const startRight = rightSidebarWidth;
+
+		resizingSidebar = side;
+
+		const target = e.currentTarget as HTMLElement | null;
+		target?.setPointerCapture?.(e.pointerId);
+
+		// 避免拖拽时选中文本
+		const body = document.body;
+		const prevCursor = body.style.cursor;
+		const prevUserSelect = body.style.userSelect;
+		body.style.cursor = 'col-resize';
+		body.style.userSelect = 'none';
+
+		const onMove = (ev: PointerEvent) => {
+			const vw = getViewportWidth();
+			if (vw <= 0) return;
+
+			const dx = ev.clientX - startX;
+			if (side === 'left') {
+				const max = Math.max(LEFT_SIDEBAR_MIN_PX, Math.min(LEFT_SIDEBAR_MAX_PX, vw - startRight - CENTER_MIN_PX));
+				leftSidebarWidth = Math.round(clamp(startLeft + dx, LEFT_SIDEBAR_MIN_PX, max));
+			} else {
+				const max = Math.max(RIGHT_SIDEBAR_MIN_PX, Math.min(RIGHT_SIDEBAR_MAX_PX, vw - startLeft - CENTER_MIN_PX));
+				rightSidebarWidth = Math.round(clamp(startRight - dx, RIGHT_SIDEBAR_MIN_PX, max));
+			}
+		};
+
+		const end = () => {
+			document.removeEventListener('pointermove', onMove);
+			document.removeEventListener('pointerup', end);
+			document.removeEventListener('pointercancel', end);
+
+			body.style.cursor = prevCursor;
+			body.style.userSelect = prevUserSelect;
+
+			resizingSidebar = null;
+
+			writeLayout({ v: 1, leftSidebarWidth, rightSidebarWidth });
+		};
+
+		document.addEventListener('pointermove', onMove);
+		document.addEventListener('pointerup', end);
+		document.addEventListener('pointercancel', end);
+
+		e.preventDefault();
+		e.stopPropagation();
 	}
 
 	function closePanels() {
@@ -925,9 +1062,29 @@
 			messages = [];
 		}
 
+		// 桌面端布局：左右侧栏宽度（可拖拽）
+		const savedLayout = readLayout();
+		const layout = clampLayoutToViewport(
+			savedLayout?.leftSidebarWidth ?? leftSidebarWidth,
+			savedLayout?.rightSidebarWidth ?? rightSidebarWidth
+		);
+		leftSidebarWidth = layout.left;
+		rightSidebarWidth = layout.right;
+
+		const handleResize = () => {
+			if (resizingSidebar) return;
+			const next = clampLayoutToViewport(leftSidebarWidth, rightSidebarWidth);
+			leftSidebarWidth = next.left;
+			rightSidebarWidth = next.right;
+		};
+
+		window.addEventListener('resize', handleResize);
+
 		conversationSearchCache.clear();
 		conversationsHydrated = true;
 		settingsHydrated = true;
+
+		return () => window.removeEventListener('resize', handleResize);
 	});
 
 	$effect(() => {
@@ -1240,7 +1397,7 @@
 <svelte:window onkeydown={handleGlobalKeydown} />
 
 <div class="container">
-	<div class="grid">
+	<div class="grid" style={`--left-sidebar-width: ${leftSidebarWidth}px; --right-sidebar-width: ${rightSidebarWidth}px;`}>
 		<aside class="conversations-panel" class:open={conversationsOpen}>
 			<div class="panel-header">
 				<h2>会话</h2>
@@ -1343,6 +1500,16 @@
 				/>
 			</div>
 		</aside>
+
+		<div
+			class="col-resizer col-resizer-left"
+			class:dragging={resizingSidebar === 'left'}
+			role="separator"
+			aria-label="调整会话栏宽度"
+			aria-orientation="vertical"
+			title="拖拽调整宽度"
+			onpointerdown={(e) => startSidebarResize('left', e)}
+		></div>
 
 		<section class="chat-area">
 			<div class="chat-header">
@@ -1497,6 +1664,16 @@
 				</div>
 			</div>
 		</section>
+
+		<div
+			class="col-resizer col-resizer-right"
+			class:dragging={resizingSidebar === 'right'}
+			role="separator"
+			aria-label="调整设置栏宽度"
+			aria-orientation="vertical"
+			title="拖拽调整宽度"
+			onpointerdown={(e) => startSidebarResize('right', e)}
+		></div>
 
 		{#if settingsOpen || conversationsOpen}
 			<button class="settings-overlay" type="button" aria-label="关闭面板" onclick={closePanels}></button>
