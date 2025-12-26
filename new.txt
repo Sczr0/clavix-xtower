@@ -1,0 +1,6 @@
+项目定位：EdgeAI Playground (边缘AI调试台)
+核心逻辑：
+用户在前端输入 API 地址（如 OpenAI, Anthropic 或自建的 LocalAI）和 Key，通过 ESA 的 Edge Function 进行请求转发（Proxy），实现流式对话。
+ESA 技术栈映射：
+    Pages： 托管 Chat UI 界面（React/Vue）。
+    Edge Functions： 核心组件。作为 API 网关/代理，解决跨域问题（CORS），隐藏真实 IP，处理流式响应（Streaming Response），甚至可以做简单的鉴权。
