@@ -2,6 +2,14 @@
 
 一个“边缘 AI 调试台”：前端用 SvelteKit（静态站点），后端用阿里云 ESA（Functions and Pages）的 Edge Function 作为代理转发层，支持流式对话（SSE）。
 
+## 功能
+
+- OpenAI Compatible（`/v1/chat/completions`）与 Anthropic（`/v1/messages`）上游代理与流式回传（SSE）
+- Markdown 渲染：支持代码块高亮与一键复制
+- 思维链展示：若上游返回 `reasoning/thinking` 字段，或模型输出包含 `<think>/<analysis>` 标签，会与正文拆分并在 UI 中折叠展示（默认不显示；也可按单条消息展开）
+- 设置持久化：除 API Key 外，其余运行设置会写入浏览器 `localStorage`（刷新不丢）
+- 体验优化：移动端“设置抽屉”、长对话默认仅渲染最近 200 条（可切换显示全部）、“跳到最新”按钮
+
 ## 目录结构
 
 - `src/`：SvelteKit 前端（静态构建到 `build/`）

@@ -1,6 +1,13 @@
 <script lang="ts">
-	import { tick } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { streamSse, type SseEvent } from '$lib/sse';
+	import { renderMarkdownToHtml } from '$lib/markdown';
+	import {
+		createAnthropicSseContext,
+		createThoughtChainSplitter,
+		parseAnthropicSseEvent,
+		parseOpenAiSseData
+	} from '$lib/thought-chain';
 
 	type Provider = 'openai' | 'anthropic';
 	type Role = 'user' | 'assistant';
@@ -9,6 +16,7 @@
 		id: string;
 		role: Role;
 		content: string;
+		thinking?: string;
 		at: number;
 	};
 
@@ -26,6 +34,91 @@
 		}
 	};
 
+	type ProviderCache = {
+		openai: { baseUrl: string; model: string; temperature: number };
+		anthropic: { baseUrl: string; model: string; anthropicVersion: string };
+	};
+
+	type StoredSettingsV1 = {
+		v: 1;
+		provider: Provider;
+		openai: ProviderCache['openai'];
+		anthropic: ProviderCache['anthropic'];
+		common: {
+			systemPrompt: string;
+			maxTokens: number;
+			showThinking: boolean;
+			thinkingAutoExpand: boolean;
+		};
+	};
+
+	const SETTINGS_STORAGE_KEY = 'edgeai-playground:settings:v1';
+
+	function safeString(v: unknown, fallback: string) {
+		return typeof v === 'string' ? v : fallback;
+	}
+
+	function safeBoolean(v: unknown, fallback: boolean) {
+		return typeof v === 'boolean' ? v : fallback;
+	}
+
+	function safeNumber(v: unknown, fallback: number) {
+		const n = typeof v === 'number' ? v : Number(v);
+		return Number.isFinite(n) ? n : fallback;
+	}
+
+	function clamp(n: number, min: number, max: number) {
+		return Math.min(max, Math.max(min, n));
+	}
+
+	function safeProvider(v: unknown): Provider {
+		return v === 'anthropic' || v === 'openai' ? v : 'openai';
+	}
+
+	function readSettings(): StoredSettingsV1 | null {
+		try {
+			const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+			if (!raw) return null;
+			const parsed = JSON.parse(raw) as any;
+			if (!parsed || parsed.v !== 1) return null;
+
+			const openai = parsed.openai ?? {};
+			const anthropic = parsed.anthropic ?? {};
+			const common = parsed.common ?? {};
+
+			return {
+				v: 1,
+				provider: safeProvider(parsed.provider),
+				openai: {
+					baseUrl: safeString(openai.baseUrl, DEFAULTS.openai.baseUrl),
+					model: safeString(openai.model, ''),
+					temperature: clamp(safeNumber(openai.temperature, 0.7), 0, 2)
+				},
+				anthropic: {
+					baseUrl: safeString(anthropic.baseUrl, DEFAULTS.anthropic.baseUrl),
+					model: safeString(anthropic.model, ''),
+					anthropicVersion: safeString(anthropic.anthropicVersion, DEFAULTS.anthropic.version ?? '2023-06-01')
+				},
+				common: {
+					systemPrompt: safeString(common.systemPrompt, ''),
+					maxTokens: Math.max(1, Math.floor(safeNumber(common.maxTokens, 1024))),
+					showThinking: safeBoolean(common.showThinking, false),
+					thinkingAutoExpand: safeBoolean(common.thinkingAutoExpand, false)
+				}
+			};
+		} catch {
+			return null;
+		}
+	}
+
+	function writeSettings(settings: StoredSettingsV1) {
+		try {
+			localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+		} catch {
+			// localStorage 可能被禁用（隐私模式/策略）
+		}
+	}
+
 	let provider = $state<Provider>('openai');
 	let baseUrl = $state(DEFAULTS.openai.baseUrl);
 	let apiKey = $state('');
@@ -38,14 +131,149 @@
 	let prompt = $state('');
 	let messages = $state<ChatMessage[]>([]);
 	let assistantDraft = $state('');
+	let assistantThinkingDraft = $state('');
 	let streaming = $state(false);
 	let lastEvent = $state<string | null>(null);
 	let error = $state<string | null>(null);
 
+	let settingsHydrated = $state(false);
+
+	let providerCache: ProviderCache = {
+		openai: { baseUrl: DEFAULTS.openai.baseUrl, model: '', temperature: 0.7 },
+		anthropic: {
+			baseUrl: DEFAULTS.anthropic.baseUrl,
+			model: '',
+			anthropicVersion: DEFAULTS.anthropic.version ?? '2023-06-01'
+		}
+	};
+	let lastProvider: Provider = 'openai';
+	let saveTimer: number | null = null;
+
+	let settingsOpen = $state(false);
+
+	let showThinking = $state(false);
+	let thinkingAutoExpand = $state(false);
+	let thinkingVisibleById = $state<Record<string, boolean>>({});
+	let thinkingOpenById = $state<Record<string, boolean>>({});
+	let streamingThinkingVisible = $state(false);
+	let streamingThinkingOpen = $state(false);
+
 	let messagesEl: HTMLDivElement | null = null;
 	let stickToBottom = $state(true);
+	const MAX_RENDER_MESSAGES = 200;
+	let renderAllMessages = $state(false);
 
 	let abortController: AbortController | null = null;
+
+	let thoughtSplitter = createThoughtChainSplitter();
+	let anthropicCtx = createAnthropicSseContext();
+
+	function handleGlobalKeydown(e: KeyboardEvent) {
+		if (e.key !== 'Escape') return;
+		settingsOpen = false;
+	}
+
+	async function copyToClipboard(text: string) {
+		if (!text) return;
+		try {
+			await navigator.clipboard.writeText(text);
+			return;
+		} catch {
+			// 兼容：Safari/部分 WebView 可能不支持 clipboard API
+		}
+
+		const el = document.createElement('textarea');
+		el.value = text;
+		el.style.position = 'fixed';
+		el.style.left = '-9999px';
+		el.style.top = '0';
+		document.body.appendChild(el);
+		el.select();
+		document.execCommand('copy');
+		document.body.removeChild(el);
+	}
+
+	function handleMessagesClick(e: MouseEvent) {
+		const target = e.target as HTMLElement | null;
+		const btn = target?.closest?.('button[data-copy-code]') as HTMLButtonElement | null;
+		if (!btn) return;
+
+		const root = btn.closest?.('.md-code') as HTMLElement | null;
+		const codeEl = root?.querySelector?.('pre code') as HTMLElement | null;
+		const text = codeEl?.textContent ?? '';
+		if (!text) return;
+
+		btn.disabled = true;
+		const oldText = btn.textContent ?? '复制';
+
+		void copyToClipboard(text)
+			.then(() => {
+				btn.textContent = '已复制';
+				setTimeout(() => {
+					btn.textContent = oldText;
+					btn.disabled = false;
+				}, 1200);
+			})
+			.catch(() => {
+				btn.textContent = '复制失败';
+				setTimeout(() => {
+					btn.textContent = oldText;
+					btn.disabled = false;
+				}, 1200);
+			});
+	}
+
+	function delegateCopy(el: HTMLElement) {
+		const onClick = (e: MouseEvent) => handleMessagesClick(e);
+		el.addEventListener('click', onClick);
+		return {
+			destroy() {
+				el.removeEventListener('click', onClick);
+			}
+		};
+	}
+
+	function getMessageThinkingOpen(id: string) {
+		const v = thinkingOpenById[id];
+		return typeof v === 'boolean' ? v : thinkingAutoExpand;
+	}
+
+	function toggleMessageThinking(id: string) {
+		if (showThinking) {
+			thinkingOpenById[id] = !getMessageThinkingOpen(id);
+			return;
+		}
+
+		const nextVisible = !thinkingVisibleById[id];
+		thinkingVisibleById[id] = nextVisible;
+		thinkingOpenById[id] = nextVisible ? true : false;
+	}
+
+	function handleMessageThinkingToggle(id: string, e: Event) {
+		const details = e.currentTarget as HTMLDetailsElement;
+		thinkingOpenById[id] = details.open;
+		if (!showThinking) thinkingVisibleById[id] = true;
+	}
+
+	function getStreamingThinkingOpen() {
+		return streamingThinkingOpen || thinkingAutoExpand;
+	}
+
+	function toggleStreamingThinking() {
+		if (showThinking) {
+			streamingThinkingOpen = !getStreamingThinkingOpen();
+			return;
+		}
+
+		streamingThinkingVisible = !streamingThinkingVisible;
+		if (streamingThinkingVisible) streamingThinkingOpen = true;
+	}
+
+	function handleStreamingThinkingToggle(e: Event) {
+		const details = e.currentTarget as HTMLDetailsElement;
+		streamingThinkingOpen = details.open;
+		if (!showThinking) streamingThinkingVisible = true;
+	}
 
 	function syncStickToBottom() {
 		if (!messagesEl) return;
@@ -64,26 +292,113 @@
 		// 依赖：消息/草稿/流式状态变化时，若用户在底部附近则自动跟随滚动
 		messages.length;
 		assistantDraft;
+		assistantThinkingDraft;
 		streaming;
 
 		if (!stickToBottom) return;
 		void scrollMessagesToBottom();
 	});
 
-	function resetForProvider(next: Provider) {
-		baseUrl = DEFAULTS[next].baseUrl;
-		model = '';
+	function snapshotProviderToCache(p: Provider) {
+		if (p === 'openai') {
+			providerCache.openai.baseUrl = baseUrl;
+			providerCache.openai.model = model;
+			providerCache.openai.temperature = clamp(Number.isFinite(temperature) ? temperature : 0.7, 0, 2);
+		} else {
+			providerCache.anthropic.baseUrl = baseUrl;
+			providerCache.anthropic.model = model;
+			providerCache.anthropic.anthropicVersion = anthropicVersion;
+		}
+	}
+
+	function applyCacheToFields(p: Provider) {
+		if (p === 'openai') {
+			baseUrl = providerCache.openai.baseUrl || DEFAULTS.openai.baseUrl;
+			model = providerCache.openai.model || '';
+			temperature = clamp(Number.isFinite(providerCache.openai.temperature) ? providerCache.openai.temperature : 0.7, 0, 2);
+			return;
+		}
+
+		baseUrl = providerCache.anthropic.baseUrl || DEFAULTS.anthropic.baseUrl;
+		model = providerCache.anthropic.model || '';
+		anthropicVersion = providerCache.anthropic.anthropicVersion || (DEFAULTS.anthropic.version ?? '2023-06-01');
+	}
+
+	function switchProvider(next: Provider) {
+		// 保存“上一个 provider”的编辑结果，再切换到新 provider 的缓存值
+		snapshotProviderToCache(lastProvider);
+		lastProvider = next;
+		applyCacheToFields(next);
 		lastEvent = null;
 		error = null;
 	}
+
+	onMount(() => {
+		const saved = readSettings();
+		if (saved) {
+			providerCache.openai.baseUrl = saved.openai.baseUrl;
+			providerCache.openai.model = saved.openai.model;
+			providerCache.openai.temperature = saved.openai.temperature;
+
+			providerCache.anthropic.baseUrl = saved.anthropic.baseUrl;
+			providerCache.anthropic.model = saved.anthropic.model;
+			providerCache.anthropic.anthropicVersion = saved.anthropic.anthropicVersion;
+
+			systemPrompt = saved.common.systemPrompt;
+			maxTokens = saved.common.maxTokens;
+			showThinking = saved.common.showThinking;
+			thinkingAutoExpand = saved.common.thinkingAutoExpand;
+
+			provider = saved.provider;
+			lastProvider = provider;
+			applyCacheToFields(provider);
+		} else {
+			lastProvider = provider;
+			snapshotProviderToCache(provider);
+		}
+
+		settingsHydrated = true;
+	});
+
+	$effect(() => {
+		if (!settingsHydrated) return;
+
+		// 依赖：仅保存“非敏感设置”，API Key 明确不落盘
+		provider;
+		baseUrl;
+		model;
+		systemPrompt;
+		temperature;
+		maxTokens;
+		anthropicVersion;
+		showThinking;
+		thinkingAutoExpand;
+
+		if (saveTimer) window.clearTimeout(saveTimer);
+		saveTimer = window.setTimeout(() => {
+			snapshotProviderToCache(provider);
+			writeSettings({
+				v: 1,
+				provider,
+				openai: providerCache.openai,
+				anthropic: providerCache.anthropic,
+				common: {
+					systemPrompt,
+					maxTokens: Math.max(1, Math.floor(Number.isFinite(maxTokens) ? maxTokens : 1024)),
+					showThinking,
+					thinkingAutoExpand
+				}
+			});
+		}, 250);
+	});
 
 	function fmtTime(ts: number) {
 		return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 	}
 
-	function push(role: Role, content: string) {
+	function push(role: Role, content: string, thinking?: string) {
 		const id = typeof crypto?.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
-		messages.push({ id, role, content, at: Date.now() });
+		messages.push({ id, role, content, thinking, at: Date.now() });
 	}
 
 	function stop() {
@@ -94,6 +409,11 @@
 		stop();
 		messages = [];
 		assistantDraft = '';
+		assistantThinkingDraft = '';
+		thinkingVisibleById = {};
+		thinkingOpenById = {};
+		streamingThinkingVisible = false;
+		streamingThinkingOpen = false;
 		error = null;
 		lastEvent = null;
 		stickToBottom = true;
@@ -111,31 +431,31 @@
 	}
 
 	function applyOpenAiDelta(event: SseEvent) {
-		if (event.data === '[DONE]') return false;
-		try {
-			const parsed = JSON.parse(event.data) as any;
-			const delta = parsed?.choices?.[0]?.delta;
-			if (typeof delta?.content === 'string') assistantDraft += delta.content;
-			const text = parsed?.choices?.[0]?.text;
-			if (typeof text === 'string') assistantDraft += text;
-		} catch {
-			// 忽略无法解析的碎片
+		const { done, contentDelta, thinkingDelta } = parseOpenAiSseData(event.data);
+		if (done) return false;
+
+		if (typeof thinkingDelta === 'string' && thinkingDelta) assistantThinkingDraft += thinkingDelta;
+
+		if (typeof contentDelta === 'string' && contentDelta) {
+			const out = thoughtSplitter.push(contentDelta);
+			if (out.contentDelta) assistantDraft += out.contentDelta;
+			if (out.thinkingDelta) assistantThinkingDraft += out.thinkingDelta;
 		}
+
 		return true;
 	}
 
 	function applyAnthropicDelta(event: SseEvent) {
-		try {
-			const parsed = JSON.parse(event.data) as any;
-			const type = (event.event ?? parsed?.type ?? '') as string;
-			if (type === 'content_block_delta') {
-				const delta = parsed?.delta ?? {};
-				if (typeof delta?.text === 'string') assistantDraft += delta.text;
-				else if (typeof delta?.text_delta?.text === 'string') assistantDraft += delta.text_delta.text;
-			}
-		} catch {
-			// 忽略无法解析的碎片
+		const { contentDelta, thinkingDelta } = parseAnthropicSseEvent(event, anthropicCtx);
+
+		if (typeof thinkingDelta === 'string' && thinkingDelta) assistantThinkingDraft += thinkingDelta;
+
+		if (typeof contentDelta === 'string' && contentDelta) {
+			const out = thoughtSplitter.push(contentDelta);
+			if (out.contentDelta) assistantDraft += out.contentDelta;
+			if (out.thinkingDelta) assistantThinkingDraft += out.thinkingDelta;
 		}
+
 		return true;
 	}
 
@@ -162,6 +482,11 @@
 		push('user', prompt.trim());
 		prompt = '';
 		assistantDraft = '';
+		assistantThinkingDraft = '';
+		streamingThinkingVisible = false;
+		streamingThinkingOpen = false;
+		thoughtSplitter.reset();
+		anthropicCtx = createAnthropicSseContext();
 
 		streaming = true;
 		abortController = new AbortController();
@@ -228,28 +553,46 @@
 			streaming = false;
 			abortController = null;
 
+			const flushed = thoughtSplitter.flush();
+			if (flushed.contentDelta) assistantDraft += flushed.contentDelta;
+			if (flushed.thinkingDelta) assistantThinkingDraft += flushed.thinkingDelta;
+
 			const finalText = assistantDraft.trim();
-			if (finalText) {
-				push('assistant', finalText);
-				assistantDraft = '';
+			const finalThinking = assistantThinkingDraft.trim();
+			if (finalText || finalThinking) {
+				push('assistant', finalText, finalThinking || undefined);
 			}
+
+			assistantDraft = '';
+			assistantThinkingDraft = '';
+			streamingThinkingVisible = false;
+			streamingThinkingOpen = false;
 		}
 	}
 </script>
+
+<svelte:window onkeydown={handleGlobalKeydown} />
 
 <div class="container">
 	<div class="grid">
 		<section class="chat-area">
 			<div class="chat-header">
-				<h1>EdgeAI Playground</h1>
-				<p>
-					同域 `/api/chat` 由 ESA Edge Function 代理转发并流式回传（SSE）。<span class="nowrap"
-						>最后事件：{lastEvent ?? '—'}</span
-					>
-				</p>
+				<div class="chat-title">
+					<h1>EdgeAI Playground</h1>
+					<p>
+						同域 `/api/chat` 由 ESA Edge Function 代理转发并流式回传（SSE）。<span class="nowrap"
+							>最后事件：{lastEvent ?? '—'}</span
+						>
+					</p>
+				</div>
+				<div class="chat-actions">
+					<button class="btn btn-sm settings-toggle" type="button" onclick={() => (settingsOpen = true)}>
+						设置
+					</button>
+				</div>
 			</div>
 
-			<div class="messages" bind:this={messagesEl} onscroll={syncStickToBottom}>
+			<div class="messages" bind:this={messagesEl} onscroll={syncStickToBottom} use:delegateCopy>
 				{#if error}
 					<div class="error">{error}</div>
 				{/if}
@@ -258,21 +601,59 @@
 					<div class="msg system-intro">
 						<div class="logo">EdgeAI</div>
 						<p>
-							1) 在右侧选择 Provider，填写 Base URL / Key / Model<br />
+							1) 在右侧面板填写 Base URL / Key / Model（手机请点右上角“设置”）<br />
 							2) 在下方输入问题，点击发送<br />
 							3) 如出现 504，多数是上游首包太慢或被阻断；请检查网络、模型与 Base URL
 						</p>
 					</div>
 				{/if}
 
-				{#each messages as m (m.id)}
+				{#if messages.length > MAX_RENDER_MESSAGES}
+					<div class="history-notice">
+						<span>历史消息：</span>
+						{#if renderAllMessages}
+							<span class="muted">当前显示全部（可能影响性能）。</span>
+							<button class="link" type="button" onclick={() => (renderAllMessages = false)}>仅显示最后 {MAX_RENDER_MESSAGES} 条</button>
+						{:else}
+							<span class="muted">已折叠前 {messages.length - MAX_RENDER_MESSAGES} 条（仍会发送给上游）。</span>
+							<button class="link" type="button" onclick={() => (renderAllMessages = true)}>显示全部</button>
+						{/if}
+					</div>
+				{/if}
+
+				{#each (renderAllMessages ? messages : messages.slice(-MAX_RENDER_MESSAGES)) as m (m.id)}
 					<div class="msg {m.role}">
 						<div class="msg-content">
 							<div class="meta">
-								<strong>{m.role === 'user' ? 'User' : 'Assistant'}</strong>
+								<strong>{m.role === 'user' ? '用户' : '助手'}</strong>
 								<span>{fmtTime(m.at)}</span>
+								{#if m.role === 'assistant' && m.thinking?.trim()}
+									<button class="meta-pill" type="button" onclick={() => toggleMessageThinking(m.id)}>
+										{showThinking
+											? getMessageThinkingOpen(m.id)
+												? '收起思维链'
+												: '展开思维链'
+											: thinkingVisibleById[m.id]
+												? '隐藏思维链'
+												: '思维链'}
+									</button>
+								{/if}
 							</div>
-							<pre>{m.content}</pre>
+							{#if m.content.trim()}
+								<div class="md">{@html renderMarkdownToHtml(m.content)}</div>
+							{:else}
+								<div class="empty-content muted">（正文为空）</div>
+							{/if}
+							{#if m.role === 'assistant' && m.thinking?.trim() && (showThinking || thinkingVisibleById[m.id])}
+								<details
+									class="thinking"
+									open={getMessageThinkingOpen(m.id)}
+									ontoggle={(e) => handleMessageThinkingToggle(m.id, e)}
+								>
+									<summary>思维链</summary>
+									<pre>{m.thinking}</pre>
+								</details>
+							{/if}
 						</div>
 					</div>
 				{/each}
@@ -281,14 +662,44 @@
 					<div class="msg assistant">
 						<div class="msg-content">
 							<div class="meta">
-								<strong>Assistant</strong>
-								<span class="ok">Generating...</span>
+								<strong>助手</strong>
+								<span class="ok">生成中...</span>
+								{#if assistantThinkingDraft.trim()}
+									<button class="meta-pill" type="button" onclick={toggleStreamingThinking}>
+										{showThinking
+											? getStreamingThinkingOpen()
+												? '收起思维链'
+												: '展开思维链'
+											: streamingThinkingVisible
+												? '隐藏思维链'
+												: '思维链'}
+									</button>
+								{/if}
 							</div>
 							<pre>{assistantDraft}</pre>
+							{#if assistantThinkingDraft.trim() && (showThinking || streamingThinkingVisible)}
+								<details class="thinking" open={getStreamingThinkingOpen()} ontoggle={handleStreamingThinkingToggle}>
+									<summary>思维链</summary>
+									<pre>{assistantThinkingDraft}</pre>
+								</details>
+							{/if}
 						</div>
 					</div>
 				{/if}
 			</div>
+
+			{#if !stickToBottom && messages.length > 0}
+				<button
+					class="jump-to-latest"
+					type="button"
+					onclick={() => {
+						stickToBottom = true;
+						void scrollMessagesToBottom();
+					}}
+				>
+					跳到最新
+				</button>
+			{/if}
 
 			<div class="composer-wrapper">
 				<div class="composer">
@@ -315,32 +726,46 @@
 			</div>
 		</section>
 
-		<aside class="settings-panel">
-			<div class="panel-header">
-				<h2>Run settings</h2>
-				<span class="pill">{streaming ? 'Streaming' : 'Idle'}</span>
-			</div>
-			<div class="panel-body">
-				<div class="field-group">
-					<div class="field">
-						<label for="provider">Provider</label>
-						<select
-							id="provider"
-							bind:value={provider}
-							onchange={() => resetForProvider(provider)}
-							disabled={streaming}
-						>
-							<option value="openai">OpenAI Compatible</option>
-							<option value="anthropic">Anthropic</option>
-						</select>
-					</div>
+		{#if settingsOpen}
+			<button
+				class="settings-overlay"
+				type="button"
+				aria-label="关闭设置"
+				onclick={() => (settingsOpen = false)}
+			></button>
+		{/if}
 
-					<div class="field">
-						<label for="baseUrl">Base URL</label>
-						<input
-							id="baseUrl"
-							bind:value={baseUrl}
-							placeholder="https://api.openai.com"
+			<aside class="settings-panel" class:open={settingsOpen}>
+				<div class="panel-header">
+					<h2>运行设置</h2>
+					<div class="panel-header-actions">
+						<span class="pill">{streaming ? '生成中' : '空闲'}</span>
+						<button class="btn btn-sm panel-close" type="button" onclick={() => (settingsOpen = false)}>
+							关闭
+						</button>
+					</div>
+				</div>
+				<div class="panel-body">
+					<div class="field-group">
+						<div class="field">
+							<label for="provider">提供方</label>
+							<select
+								id="provider"
+								bind:value={provider}
+								onchange={() => switchProvider(provider)}
+								disabled={streaming}
+							>
+								<option value="openai">OpenAI Compatible（兼容）</option>
+								<option value="anthropic">Anthropic</option>
+							</select>
+						</div>
+
+						<div class="field">
+							<label for="baseUrl">Base URL（上游地址）</label>
+							<input
+								id="baseUrl"
+								bind:value={baseUrl}
+								placeholder="https://api.openai.com"
 							disabled={streaming}
 							autocapitalize="off"
 							autocomplete="off"
@@ -348,12 +773,12 @@
 						/>
 					</div>
 
-					<div class="field">
-						<label for="apiKey">API Key</label>
-						<input
-							id="apiKey"
-							type="password"
-							bind:value={apiKey}
+						<div class="field">
+							<label for="apiKey">API Key</label>
+							<input
+								id="apiKey"
+								type="password"
+								bind:value={apiKey}
 							placeholder="sk-..."
 							disabled={streaming}
 							autocapitalize="off"
@@ -362,12 +787,12 @@
 						/>
 					</div>
 
-					<div class="field">
-						<label for="model">Model</label>
-						<input
-							id="model"
-							bind:value={model}
-							placeholder={DEFAULTS[provider].modelPlaceholder}
+						<div class="field">
+							<label for="model">模型</label>
+							<input
+								id="model"
+								bind:value={model}
+								placeholder={DEFAULTS[provider].modelPlaceholder}
 							disabled={streaming}
 							autocapitalize="off"
 							autocomplete="off"
@@ -376,23 +801,42 @@
 					</div>
 				</div>
 
-				<div class="field-group">
-					<div class="field">
-						<label for="system">System Instructions</label>
-						<textarea
-							id="system"
-							bind:value={systemPrompt}
-							placeholder="Optional tone and style instructions for the model"
-							disabled={streaming}
-							rows="3"
-						></textarea>
+					<div class="field-group">
+						<div class="field">
+							<label for="system">系统提示词</label>
+							<textarea
+								id="system"
+								bind:value={systemPrompt}
+								placeholder="可选：控制语气、格式、输出偏好等"
+								disabled={streaming}
+								rows="3"
+							></textarea>
+						</div>
 					</div>
-				</div>
+
+					<div class="field-group">
+						<div class="field">
+							<label for="showThinking">调试</label>
+							<label class="checkbox">
+								<input id="showThinking" type="checkbox" bind:checked={showThinking} />
+								<span>默认显示思维链（也可在单条消息里点“思维链”查看）</span>
+							</label>
+							<label class="checkbox">
+								<input
+									id="thinkingAutoExpand"
+									type="checkbox"
+									bind:checked={thinkingAutoExpand}
+									disabled={!showThinking}
+								/>
+								<span>默认展开</span>
+							</label>
+						</div>
+					</div>
 
 				<div class="field-group">
 					<div class="field">
 						<div class="label-row">
-							<label for="temperature">Temperature</label>
+							<label for="temperature">Temperature（温度）</label>
 							<span class="val">{temperature}</span>
 						</div>
 						<input
@@ -407,13 +851,13 @@
 					</div>
 
 					<div class="field">
-						<label for="maxTokens">Max tokens</label>
+						<label for="maxTokens">最大输出 tokens</label>
 						<input id="maxTokens" type="number" min="1" step="1" bind:value={maxTokens} disabled={streaming} />
 					</div>
 
 					{#if provider === 'anthropic'}
 						<div class="field">
-							<label for="anthropicVersion">Version</label>
+							<label for="anthropicVersion">版本</label>
 							<input
 								id="anthropicVersion"
 								bind:value={anthropicVersion}
@@ -428,9 +872,9 @@
 				</div>
 
 				<div class="actions">
-					<button class="btn danger full" type="button" onclick={stop} disabled={!streaming}>Stop</button>
+					<button class="btn danger full" type="button" onclick={stop} disabled={!streaming}>停止</button>
 					<button class="btn full" type="button" onclick={clearChat} disabled={streaming || messages.length === 0}>
-						Clear chat
+						清空对话
 					</button>
 				</div>
 			</div>
