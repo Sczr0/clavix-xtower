@@ -210,15 +210,89 @@
 
 <div class="container">
 	<div class="grid">
-		<section class="card">
-			<div class="card-header">
-				<h2 class="card-title">
-					<span>连接设置</span>
-					<span class="pill">{streaming ? 'Streaming' : 'Idle'}</span>
-				</h2>
+		<section class="chat-area">
+			<div class="chat-header">
+				<h1>EdgeAI Playground</h1>
+				<p>
+					同域 `/api/chat` 由 ESA Edge Function 代理转发并流式回传（SSE）。<span class="nowrap"
+						>最后事件：{lastEvent ?? '—'}</span
+					>
+				</p>
 			</div>
-			<div class="card-body">
-				<div class="row">
+
+			<div class="messages">
+				{#if error}
+					<div class="error">{error}</div>
+				{/if}
+
+				{#if messages.length === 0}
+					<div class="msg system-intro">
+						<div class="logo">EdgeAI</div>
+						<p>
+							1) 在右侧选择 Provider，填写 Base URL / Key / Model<br />
+							2) 在下方输入问题，点击发送<br />
+							3) 如出现 504，多数是上游首包太慢或被阻断；请检查网络、模型与 Base URL
+						</p>
+					</div>
+				{/if}
+
+				{#each messages as m (m.id)}
+					<div class="msg {m.role}">
+						<div class="msg-content">
+							<div class="meta">
+								<strong>{m.role === 'user' ? 'User' : 'Assistant'}</strong>
+								<span>{fmtTime(m.at)}</span>
+							</div>
+							<pre>{m.content}</pre>
+						</div>
+					</div>
+				{/each}
+
+				{#if streaming}
+					<div class="msg assistant">
+						<div class="msg-content">
+							<div class="meta">
+								<strong>Assistant</strong>
+								<span class="ok">Generating...</span>
+							</div>
+							<pre>{assistantDraft}</pre>
+						</div>
+					</div>
+				{/if}
+			</div>
+
+			<div class="composer-wrapper">
+				<div class="composer">
+					<textarea
+						id="prompt"
+						bind:value={prompt}
+						placeholder="输入提示词..."
+						disabled={streaming}
+						onkeydown={(e) => {
+							if (e.key !== 'Enter' || e.shiftKey) return;
+							e.preventDefault();
+							void send();
+						}}
+					></textarea>
+					<div class="composer-actions">
+						<button class="btn-icon" type="button" onclick={send} disabled={streaming || !prompt.trim()} aria-label="发送">
+							<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+						</button>
+					</div>
+				</div>
+				<div class="composer-footer">
+					<a href="https://www.alibabacloud.com/help/zh/esa" target="_blank" rel="noreferrer">ESA 文档</a>
+				</div>
+			</div>
+		</section>
+
+		<aside class="settings-panel">
+			<div class="panel-header">
+				<h2>Run settings</h2>
+				<span class="pill">{streaming ? 'Streaming' : 'Idle'}</span>
+			</div>
+			<div class="panel-body">
+				<div class="field-group">
 					<div class="field">
 						<label for="provider">Provider</label>
 						<select
@@ -233,19 +307,16 @@
 					</div>
 
 					<div class="field">
-						<label for="baseUrl">上游 Base URL</label>
+						<label for="baseUrl">Base URL</label>
 						<input
 							id="baseUrl"
 							bind:value={baseUrl}
-							placeholder="例如：https://api.openai.com 或 https://openrouter.ai/api/v1"
+							placeholder="https://api.openai.com"
 							disabled={streaming}
 							autocapitalize="off"
 							autocomplete="off"
 							spellcheck="false"
 						/>
-						<div class="help">
-							ESA Fetch API 不支持 IP 地址；如需接入 LocalAI，请用隧道/反代暴露为公网域名的 HTTPS。
-						</div>
 					</div>
 
 					<div class="field">
@@ -254,7 +325,7 @@
 							id="apiKey"
 							type="password"
 							bind:value={apiKey}
-							placeholder="仅保存在浏览器内存，不会写入持久化存储"
+							placeholder="sk-..."
 							disabled={streaming}
 							autocapitalize="off"
 							autocomplete="off"
@@ -274,29 +345,36 @@
 							spellcheck="false"
 						/>
 					</div>
+				</div>
 
+				<div class="field-group">
 					<div class="field">
-						<label for="system">System（可选）</label>
+						<label for="system">System Instructions</label>
 						<textarea
 							id="system"
 							bind:value={systemPrompt}
-							placeholder="例如：你是一个严格遵循指令的助手。"
+							placeholder="Optional tone and style instructions for the model"
 							disabled={streaming}
+							rows="3"
 						></textarea>
 					</div>
+				</div>
 
+				<div class="field-group">
 					<div class="field">
-						<label for="temperature">Temperature</label>
+						<div class="label-row">
+							<label for="temperature">Temperature</label>
+							<span class="val">{temperature}</span>
+						</div>
 						<input
 							id="temperature"
-							type="number"
+							type="range"
 							min="0"
 							max="2"
 							step="0.1"
 							bind:value={temperature}
 							disabled={streaming || provider !== 'openai'}
 						/>
-						<div class="help">{provider === 'openai' ? 'OpenAI Compatible 生效。' : 'Anthropic 忽略该参数。'}</div>
 					</div>
 
 					<div class="field">
@@ -306,11 +384,11 @@
 
 					{#if provider === 'anthropic'}
 						<div class="field">
-							<label for="anthropicVersion">anthropic-version</label>
+							<label for="anthropicVersion">Version</label>
 							<input
 								id="anthropicVersion"
 								bind:value={anthropicVersion}
-								placeholder="例如：2023-06-01"
+								placeholder="2023-06-01"
 								disabled={streaming}
 								autocapitalize="off"
 								autocomplete="off"
@@ -318,93 +396,15 @@
 							/>
 						</div>
 					{/if}
-
-					<div class="actions">
-						<button class="btn danger" type="button" onclick={stop} disabled={!streaming}>停止</button>
-						<button class="btn" type="button" onclick={clearChat} disabled={streaming || messages.length === 0}>
-							清空对话
-						</button>
-					</div>
-
-					<div class="help">
-						强提醒：允许自定义上游会带来开放代理/滥用风险；建议上线前启用域名白名单、限流与风控。
-					</div>
-				</div>
-			</div>
-		</section>
-
-		<section class="card chat">
-			<div class="chat-header">
-				<h1>EdgeAI Playground</h1>
-				<p>
-					同域 `/api/chat` 由 ESA Edge Function 代理转发并流式回传（SSE）。<span class="nowrap"
-						>最后事件：{lastEvent ?? '—'}</span
-					>
-				</p>
-			</div>
-
-			<div class="messages">
-				{#if error}
-					<div class="error">{error}</div>
-				{/if}
-
-				{#if messages.length === 0}
-					<div class="msg">
-						<div class="meta"><span class="dim">提示</span></div>
-						<pre>
-1) 选择 Provider，填写 Base URL / Key / Model
-2) 在下方输入问题，点击发送
-3) 如出现 504，多数是上游首包太慢或被阻断；请检查网络、模型与 Base URL</pre
-						>
-					</div>
-				{/if}
-
-				{#each messages as m (m.id)}
-					<div class="msg {m.role}">
-						<div class="meta">
-							<span>{m.role === 'user' ? 'User' : 'Assistant'}</span>
-							<span>{fmtTime(m.at)}</span>
-						</div>
-						<pre>{m.content}</pre>
-					</div>
-				{/each}
-
-				{#if streaming}
-					<div class="msg assistant">
-						<div class="meta">
-							<span>Assistant（生成中）</span>
-							<span class="ok">...</span>
-						</div>
-						<pre>{assistantDraft}</pre>
-					</div>
-				{/if}
-			</div>
-
-			<div class="composer">
-				<div class="field">
-					<label for="prompt">输入</label>
-					<textarea
-						id="prompt"
-						bind:value={prompt}
-						placeholder="Shift+Enter 换行，Enter 发送（可在输入法候选后再按 Enter）"
-						disabled={streaming}
-						onkeydown={(e) => {
-							if (e.key !== 'Enter' || e.shiftKey) return;
-							e.preventDefault();
-							void send();
-						}}
-					></textarea>
 				</div>
 
 				<div class="actions">
-					<button class="btn primary" type="button" onclick={send} disabled={streaming || !prompt.trim()}>
-						发送
+					<button class="btn danger full" type="button" onclick={stop} disabled={!streaming}>Stop</button>
+					<button class="btn full" type="button" onclick={clearChat} disabled={streaming || messages.length === 0}>
+						Clear chat
 					</button>
-					<a class="btn" href="https://www.alibabacloud.com/help/zh/esa" target="_blank" rel="noreferrer">
-						ESA 文档
-					</a>
 				</div>
 			</div>
-		</section>
+		</aside>
 	</div>
 </div>

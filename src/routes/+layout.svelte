@@ -14,8 +14,4 @@
 	<main class="app-main">
 		{@render children()}
 	</main>
-
-	<footer class="site-footer" aria-label="网站备案信息">
-		<a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">皖ICP备2025107155号</a>
-	</footer>
 </div>
