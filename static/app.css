@@ -140,8 +140,6 @@ input {
 	display: flex;
 	flex-direction: column;
 	gap: 24px;
-	max-width: 900px;
-	margin: 0 auto;
 	width: 100%;
 	min-height: 0;
 	-webkit-overflow-scrolling: touch;
@@ -154,9 +152,7 @@ input {
 	position: sticky;
 	top: 0;
 	z-index: 6;
-	align-self: center;
 	width: 100%;
-	max-width: 900px;
 	display: flex;
 	align-items: center;
 	gap: 8px;
@@ -523,10 +519,11 @@ button.link:hover {
 .composer-wrapper {
 	position: absolute;
 	bottom: calc(24px + env(safe-area-inset-bottom));
-	left: 50%;
-	transform: translateX(-50%);
+	left: 0;
+	right: 0;
+	transform: none;
 	width: 100%;
-	max-width: 800px;
+	max-width: none;
 	padding: 0 24px;
 	z-index: 10;
 }
