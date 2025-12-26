@@ -16,6 +16,7 @@
 		normalizeConversationTitle,
 		createId
 	} from '$lib/conversations';
+	import { buildProxyCurl, buildUpstreamCurl, buildUpstreamUrl, maskApiKey, prettyJson, truncateText } from '$lib/debug';
 	import {
 		createAnthropicSseContext,
 		createThoughtChainSplitter,
@@ -52,6 +53,45 @@
 		lastSnippet: string;
 		pinned: boolean;
 	};
+
+	type DebugTab = 'settings' | 'debug';
+
+	type DebugEvent = {
+		n: number;
+		at: number;
+		event: string | null;
+		id: string | null;
+		dataLen: number;
+		dataSnippet: string;
+	};
+
+	type DebugSession = {
+		startedAt: number;
+		endedAt: number | null;
+		aborted: boolean;
+		provider: Provider;
+		baseUrl: string;
+		model: string;
+		anthropicVersion?: string;
+		upstreamUrl: string;
+		proxyStatus: number | null;
+		proxyOk: boolean | null;
+		proxyErrorText: string | null;
+		firstEventAt: number | null;
+		eventCount: number;
+		bytesApprox: number;
+		events: DebugEvent[];
+		origin: string;
+		proxyPayloadBase: { provider: Provider; baseUrl: string; anthropicVersion?: string; request: any };
+		proxyPayloadMaskedJson: string;
+		upstreamRequestJson: string;
+		proxyCurl: string;
+		upstreamCurl: string;
+	};
+
+	const DEBUG_MAX_EVENTS = 300;
+	const DEBUG_EVENT_SNIPPET_MAX = 900;
+	const DEBUG_ERROR_SNIPPET_MAX = 12_000;
 
 	type UpstreamError = {
 		status?: number;
@@ -184,6 +224,8 @@
 
 	let settingsOpen = $state(false);
 	let conversationsOpen = $state(false);
+	let rightPanelTab = $state<DebugTab>('settings');
+	let debugSession = $state<DebugSession | null>(null);
 
 	let showThinking = $state(false);
 	let thinkingAutoExpand = $state(false);
@@ -347,6 +389,13 @@
 	function openSettingsPanel() {
 		settingsOpen = true;
 		conversationsOpen = false;
+		rightPanelTab = 'settings';
+	}
+
+	function openDebugPanel() {
+		settingsOpen = true;
+		conversationsOpen = false;
+		rightPanelTab = 'debug';
 	}
 
 	function openConversationsPanel() {
@@ -601,6 +650,80 @@
 		});
 	}
 
+	function clearDebugSession() {
+		debugSession = null;
+	}
+
+	function confirmCopyIncludesApiKey(label: string) {
+		if (!apiKey.trim()) {
+			window.alert(`${label} 需要 API Key，但当前输入为空。`);
+			return false;
+		}
+
+		return window.confirm(
+			`${label} 将包含 API Key（明文）。\n\n请确认：\n- 只粘贴到可信环境\n- 不要截图/录屏/提交到仓库\n- 不要发到群聊或工单\n\n继续吗？`
+		);
+	}
+
+	async function copyDebugProxyJson(includeKey: boolean) {
+		if (!debugSession) return;
+		if (includeKey && !confirmCopyIncludesApiKey('复制 /api/chat 请求 JSON')) return;
+
+		const text = includeKey
+			? prettyJson({ ...debugSession.proxyPayloadBase, apiKey: apiKey.trim() })
+			: debugSession.proxyPayloadMaskedJson;
+
+		await copyToClipboard(text || '');
+	}
+
+	async function copyDebugProxyCurl(includeKey: boolean) {
+		if (!debugSession) return;
+		if (includeKey && !confirmCopyIncludesApiKey('复制 Proxy curl')) return;
+
+		const payload = { ...debugSession.proxyPayloadBase, apiKey: apiKey.trim() };
+		const text = includeKey
+			? buildProxyCurl({ origin: debugSession.origin, payload, includeKey: true })
+			: debugSession.proxyCurl;
+
+		await copyToClipboard(text || '');
+	}
+
+	async function copyDebugUpstreamCurl(includeKey: boolean) {
+		if (!debugSession) return;
+		if (includeKey && !confirmCopyIncludesApiKey('复制 Upstream curl')) return;
+
+		const text = buildUpstreamCurl({
+			provider: debugSession.provider,
+			baseUrl: debugSession.baseUrl,
+			apiKey: apiKey.trim(),
+			anthropicVersion: debugSession.anthropicVersion,
+			request: debugSession.proxyPayloadBase.request,
+			includeKey
+		});
+
+		await copyToClipboard(text || '');
+	}
+
+	function recordDebugEvent(e: SseEvent) {
+		if (!debugSession) return;
+
+		const at = Date.now();
+		if (!debugSession.firstEventAt) debugSession.firstEventAt = at;
+
+		debugSession.eventCount += 1;
+		debugSession.bytesApprox += typeof e.data === 'string' ? e.data.length : 0;
+		debugSession.events.push({
+			n: debugSession.eventCount,
+			at,
+			event: e.event,
+			id: e.id,
+			dataLen: typeof e.data === 'string' ? e.data.length : 0,
+			dataSnippet: truncateText(typeof e.data === 'string' ? e.data : String(e.data ?? ''), DEBUG_EVENT_SNIPPET_MAX)
+		});
+
+		if (debugSession.events.length > DEBUG_MAX_EVENTS) debugSession.events.shift();
+	}
+
 	function handleMessagesClick(e: MouseEvent) {
 		const target = e.target as HTMLElement | null;
 		const btn = target?.closest?.('button[data-copy-code]') as HTMLButtonElement | null;
@@ -843,6 +966,20 @@
 		return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 	}
 
+	function fmtMs(ms: number) {
+		if (!Number.isFinite(ms)) return '—';
+		if (ms < 1_000) return `${Math.round(ms)} ms`;
+		if (ms < 60_000) return `${(ms / 1000).toFixed(2)} s`;
+		return `${Math.round(ms / 1000)} s`;
+	}
+
+	function fmtBytes(n: number) {
+		if (!Number.isFinite(n) || n < 0) return '—';
+		if (n < 1024) return `${Math.round(n)} B`;
+		if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+		return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+	}
+
 	function push(role: Role, content: string, thinking?: string) {
 		const id = typeof crypto?.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
 		messages.push({ id, role, content, thinking, at: Date.now() });
@@ -917,14 +1054,17 @@
 		if (!prompt.trim()) return;
 		if (!baseUrl.trim()) {
 			error = '请填写上游 Base URL（必须是 https 域名，可选以 /v1 结尾；不允许 IP/端口/query）。';
+			openSettingsPanel();
 			return;
 		}
 		if (!apiKey.trim()) {
 			error = '请填写 API Key（仅保存在浏览器内存，不会写入服务端存储）。';
+			openSettingsPanel();
 			return;
 		}
 		if (!model.trim()) {
 			error = '请填写模型名。';
+			openSettingsPanel();
 			return;
 		}
 
@@ -953,10 +1093,15 @@
 		abortController = new AbortController();
 
 		try {
+			const trimmedBaseUrl = baseUrl.trim();
+			const trimmedApiKey = apiKey.trim();
+			const trimmedModel = model.trim();
+			const trimmedAnthropicVersion = provider === 'anthropic' ? anthropicVersion.trim() : undefined;
+
 			const request =
 				provider === 'openai'
 					? {
-							model: model.trim(),
+							model: trimmedModel,
 							messages: [
 								...(systemPrompt.trim() ? [{ role: 'system', content: systemPrompt.trim() }] : []),
 								...messages.map((m) => ({ role: m.role, content: m.content }))
@@ -966,40 +1111,89 @@
 							stream: true
 						}
 					: {
-							model: model.trim(),
+							model: trimmedModel,
 							system: systemPrompt.trim() ? systemPrompt.trim() : undefined,
 							messages: messages.map((m) => ({ role: m.role, content: [{ type: 'text', text: m.content }] })),
 							max_tokens: Number.isFinite(maxTokens) ? maxTokens : 1024,
 							stream: true
 						};
 
+			const origin = typeof location !== 'undefined' ? location.origin : '';
+			const proxyPayloadBase = {
+				provider,
+				baseUrl: trimmedBaseUrl,
+				anthropicVersion: trimmedAnthropicVersion,
+				request
+			};
+			const proxyPayload = { ...proxyPayloadBase, apiKey: trimmedApiKey };
+
+			debugSession = {
+				startedAt: Date.now(),
+				endedAt: null,
+				aborted: false,
+				provider,
+				baseUrl: trimmedBaseUrl,
+				model: trimmedModel,
+				anthropicVersion: trimmedAnthropicVersion,
+				upstreamUrl: buildUpstreamUrl(provider, trimmedBaseUrl),
+				proxyStatus: null,
+				proxyOk: null,
+				proxyErrorText: null,
+				firstEventAt: null,
+				eventCount: 0,
+				bytesApprox: 0,
+				events: [],
+				origin,
+				proxyPayloadBase,
+				proxyPayloadMaskedJson: prettyJson({ ...proxyPayloadBase, apiKey: maskApiKey(trimmedApiKey) }) || '{}',
+				upstreamRequestJson: prettyJson(request) || '{}',
+				proxyCurl: buildProxyCurl({ origin, payload: proxyPayload, includeKey: false }),
+				upstreamCurl: buildUpstreamCurl({
+					provider,
+					baseUrl: trimmedBaseUrl,
+					apiKey: trimmedApiKey,
+					anthropicVersion: trimmedAnthropicVersion,
+					request,
+					includeKey: false
+				})
+			};
+
 			const res = await fetch('/api/chat', {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({
-					provider,
-					baseUrl: baseUrl.trim(),
-					apiKey: apiKey.trim(),
-					anthropicVersion: provider === 'anthropic' ? anthropicVersion.trim() : undefined,
-					request
-				}),
+				body: JSON.stringify(proxyPayload),
 				signal: abortController.signal
 			});
+
+			if (debugSession) {
+				debugSession.proxyStatus = res.status;
+				debugSession.proxyOk = res.ok;
+			}
 
 			if (!res.ok) {
 				const text = await res.text().catch(() => '');
 				error = `代理请求失败（HTTP ${res.status}）${text ? `：${text}` : ''}`;
+				if (debugSession) debugSession.proxyErrorText = truncateText(text || `HTTP ${res.status}`, DEBUG_ERROR_SNIPPET_MAX);
+				openDebugPanel();
 				return;
 			}
 
 			await streamSse(
 				res,
 				(event) => {
+					recordDebugEvent(event);
 					lastEvent = event.event;
 
 					const proxyErr = parseProxyErrorEvent(event);
 					if (proxyErr) {
 						error = proxyErr.status ? `上游错误（HTTP ${proxyErr.status}）：${proxyErr.message}` : proxyErr.message;
+						if (debugSession) {
+							debugSession.proxyErrorText = truncateText(
+								proxyErr.status ? `HTTP ${proxyErr.status}: ${proxyErr.message}` : proxyErr.message,
+								DEBUG_ERROR_SNIPPET_MAX
+							);
+						}
+						openDebugPanel();
 						return false;
 					}
 
@@ -1008,11 +1202,22 @@
 				{ signal: abortController.signal }
 			);
 		} catch (e) {
-			if (abortController.signal.aborted) error = '已停止。';
-			else error = e instanceof Error ? e.message : String(e);
+			if (abortController.signal.aborted) {
+				error = '已停止。';
+				if (debugSession) debugSession.aborted = true;
+			} else {
+				error = e instanceof Error ? e.message : String(e);
+				openDebugPanel();
+			}
+
+			if (debugSession && !debugSession.proxyErrorText && error) {
+				debugSession.proxyErrorText = truncateText(error, DEBUG_ERROR_SNIPPET_MAX);
+			}
 		} finally {
 			streaming = false;
 			abortController = null;
+
+			if (debugSession && !debugSession.endedAt) debugSession.endedAt = Date.now();
 
 			const flushed = thoughtSplitter.flush();
 			if (flushed.contentDelta) assistantDraft += flushed.contentDelta;
@@ -1299,7 +1504,7 @@
 
 			<aside class="settings-panel" class:open={settingsOpen}>
 				<div class="panel-header">
-					<h2>运行设置</h2>
+					<h2>{rightPanelTab === 'settings' ? '运行设置' : '调试面板'}</h2>
 					<div class="panel-header-actions">
 						<span class="pill">{streaming ? '生成中' : '空闲'}</span>
 						<button class="btn btn-sm panel-close" type="button" onclick={closePanels}>
@@ -1307,7 +1512,17 @@
 						</button>
 					</div>
 				</div>
-				<div class="panel-body">
+				<div class="panel-tabs">
+					<button class="tab" type="button" class:active={rightPanelTab === 'settings'} onclick={() => (rightPanelTab = 'settings')}>
+						设置
+					</button>
+					<button class="tab" type="button" class:active={rightPanelTab === 'debug'} onclick={() => (rightPanelTab = 'debug')}>
+						调试
+					</button>
+				</div>
+
+				{#if rightPanelTab === 'settings'}
+					<div class="panel-body">
 					<div class="field-group">
 						<div class="field">
 							<label for="provider">提供方</label>
@@ -1440,6 +1655,147 @@
 					</button>
 				</div>
 			</div>
+				{:else}
+					<div class="panel-body">
+						{#if !debugSession}
+							<div class="muted">暂无调试记录。发送一次请求后，这里会显示请求、状态与事件流。</div>
+						{:else}
+							<div class="debug-section">
+								<div class="debug-section-head">
+									<strong>本次请求</strong>
+									<div class="debug-actions">
+										<button class="btn btn-sm" type="button" onclick={clearDebugSession}>清空</button>
+									</div>
+								</div>
+
+								<div class="debug-metrics">
+									<div class="debug-kv">
+										<span class="muted">开始</span>
+										<span>{fmtTime(debugSession.startedAt)}</span>
+									</div>
+									<div class="debug-kv">
+										<span class="muted">首事件</span>
+										<span
+											>{debugSession.firstEventAt
+												? fmtMs(debugSession.firstEventAt - debugSession.startedAt)
+												: '—'}</span
+										>
+									</div>
+									<div class="debug-kv">
+										<span class="muted">总耗时</span>
+										<span
+											>{debugSession.endedAt
+												? fmtMs(debugSession.endedAt - debugSession.startedAt)
+												: streaming
+													? '进行中…'
+													: '—'}</span
+										>
+									</div>
+									<div class="debug-kv">
+										<span class="muted">HTTP</span>
+										<span>{debugSession.proxyStatus ?? '—'}</span>
+									</div>
+									<div class="debug-kv">
+										<span class="muted">事件数</span>
+										<span>{debugSession.eventCount}</span>
+									</div>
+									<div class="debug-kv">
+										<span class="muted">字节(估算)</span>
+										<span>{fmtBytes(debugSession.bytesApprox)}</span>
+									</div>
+									<div class="debug-kv debug-kv-full">
+										<span class="muted">Upstream</span>
+										<span class="mono">{debugSession.upstreamUrl || '—'}</span>
+									</div>
+								</div>
+
+								{#if debugSession.aborted}
+									<div class="muted">已停止（abort）。</div>
+								{/if}
+							</div>
+
+							{#if debugSession.proxyErrorText}
+								<div class="debug-section">
+									<div class="debug-section-head">
+										<strong>错误</strong>
+										<div class="debug-actions">
+											<button
+												class="btn btn-sm"
+												type="button"
+												onclick={() => copyToClipboard(debugSession?.proxyErrorText ?? '')}
+											>
+												复制
+											</button>
+										</div>
+									</div>
+									<pre class="debug-pre">{debugSession.proxyErrorText}</pre>
+								</div>
+							{/if}
+
+							<div class="debug-section">
+								<div class="debug-section-head">
+									<strong>/api/chat 请求（默认脱敏）</strong>
+									<div class="debug-actions">
+										<button class="btn btn-sm" type="button" onclick={() => copyDebugProxyJson(false)}>复制 JSON</button>
+										<button class="btn btn-sm" type="button" onclick={() => copyDebugProxyJson(true)}>复制 JSON（含 key）</button>
+									</div>
+								</div>
+								<pre class="debug-pre">{debugSession.proxyPayloadMaskedJson}</pre>
+								<details class="debug-details">
+									<summary>上游 request（JSON）</summary>
+									<pre class="debug-pre">{debugSession.upstreamRequestJson}</pre>
+								</details>
+							</div>
+
+							<div class="debug-section">
+								<div class="debug-section-head">
+									<strong>curl 复现（默认占位 KEY）</strong>
+								</div>
+								<div class="debug-grid">
+									<div class="debug-sub">
+										<div class="debug-sub-head">
+											<span class="muted">Proxy</span>
+											<div class="debug-actions">
+												<button class="btn btn-sm" type="button" onclick={() => copyDebugProxyCurl(false)}>复制</button>
+												<button class="btn btn-sm" type="button" onclick={() => copyDebugProxyCurl(true)}>含 key</button>
+											</div>
+										</div>
+										<pre class="debug-pre">{debugSession.proxyCurl}</pre>
+									</div>
+									<div class="debug-sub">
+										<div class="debug-sub-head">
+											<span class="muted">Upstream</span>
+											<div class="debug-actions">
+												<button class="btn btn-sm" type="button" onclick={() => copyDebugUpstreamCurl(false)}>复制</button>
+												<button class="btn btn-sm" type="button" onclick={() => copyDebugUpstreamCurl(true)}>含 key</button>
+											</div>
+										</div>
+										<pre class="debug-pre">{debugSession.upstreamCurl}</pre>
+									</div>
+								</div>
+							</div>
+
+							<div class="debug-section">
+								<div class="debug-section-head">
+									<strong>SSE 事件流（最近 {debugSession.events.length}/{DEBUG_MAX_EVENTS}）</strong>
+									<span class="muted">{debugSession.eventCount > DEBUG_MAX_EVENTS ? '已截断' : ''}</span>
+								</div>
+								<div class="debug-events">
+									{#each debugSession.events as ev (ev.n)}
+										<div class="debug-event">
+											<div class="debug-event-meta">
+												<span class="pill">{ev.event ?? 'message'}</span>
+												<span class="muted">{fmtTime(ev.at)}</span>
+												<span class="muted">{ev.dataLen} chars</span>
+											</div>
+											<pre class="debug-event-pre">{ev.dataSnippet}</pre>
+										</div>
+									{/each}
+								</div>
+							</div>
+						{/if}
+					</div>
+				{/if}
 		</aside>
 	</div>
 </div>

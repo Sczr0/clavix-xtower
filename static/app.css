@@ -764,6 +764,47 @@ button.link:hover {
 	border-bottom: 1px solid var(--border);
 }
 
+.panel-tabs {
+	display: flex;
+	gap: 8px;
+	padding: 10px 12px;
+	border-bottom: 1px solid var(--border);
+	background: var(--panel-2);
+}
+
+.tab {
+	flex: 1;
+	padding: 8px 10px;
+	border-radius: 999px;
+	border: 1px solid var(--border);
+	background: var(--bg);
+	color: var(--muted);
+	font-size: 12px;
+	font-weight: 600;
+	cursor: pointer;
+	transition: all 0.2s;
+}
+
+.tab:hover {
+	border-color: var(--muted);
+}
+
+.tab.active {
+	background: var(--brand);
+	border-color: var(--brand);
+	color: #fff;
+}
+
+.tab.active:hover {
+	background: var(--brand-2);
+	border-color: var(--brand-2);
+}
+
+.tab:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
 .panel-header-actions {
 	display: flex;
 	align-items: center;
@@ -791,6 +832,122 @@ button.link:hover {
 	display: flex;
 	flex-direction: column;
 	gap: 24px;
+}
+
+.mono {
+	font-family: var(--mono);
+}
+
+.debug-section {
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	background: var(--bg);
+	padding: 12px;
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.debug-section-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.debug-actions {
+	display: flex;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.debug-metrics {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 8px 12px;
+}
+
+.debug-kv {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	font-size: 12px;
+}
+
+.debug-kv-full {
+	grid-column: 1 / -1;
+}
+
+.debug-pre {
+	margin: 0;
+	padding: 10px 12px;
+	background: var(--panel-2);
+	border: 1px solid var(--border);
+	border-radius: 10px;
+	overflow: auto;
+	max-height: 260px;
+	font-size: 12px;
+}
+
+.debug-details summary {
+	cursor: pointer;
+	font-size: 12px;
+	color: var(--brand);
+}
+
+.debug-grid {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+
+.debug-sub {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.debug-sub-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.debug-events {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	max-height: 420px;
+	overflow: auto;
+	padding-right: 4px;
+}
+
+.debug-event {
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	overflow: hidden;
+	background: var(--bg);
+}
+
+.debug-event-meta {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	padding: 10px 12px;
+	border-bottom: 1px solid var(--border);
+	background: var(--panel-2);
+}
+
+.debug-event-pre {
+	margin: 0;
+	padding: 10px 12px;
+	background: var(--panel-2);
+	overflow: auto;
+	max-height: 180px;
+	font-size: 12px;
 }
 
 .field-group {
