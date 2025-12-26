@@ -164,3 +164,9 @@ if (typeof addEventListener === 'function') {
 		event.respondWith(handleRequest(event.request));
 	});
 }
+
+export default {
+	fetch(request, env, ctx) {
+		return handleRequest(request);
+	}
+};
