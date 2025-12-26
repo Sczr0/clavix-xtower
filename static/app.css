@@ -497,6 +497,11 @@ button.link:hover {
 	background: var(--panel-2);
 	font-size: 13px;
 	color: var(--muted);
+	white-space: pre-wrap;
+	word-break: break-word;
+	overflow-wrap: anywhere;
+	max-width: 100%;
+	overflow: auto;
 }
 
 .msg.user pre {
