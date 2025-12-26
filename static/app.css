@@ -53,13 +53,17 @@ input {
 .container {
 	width: 100%;
 	height: 100vh;
+	height: 100dvh;
 	overflow: hidden;
+	min-height: 0;
 }
 
 .grid {
 	display: grid;
 	grid-template-columns: 1fr 320px;
 	height: 100%;
+	min-height: 0;
+	min-width: 0;
 }
 
 @media (max-width: 980px) {
@@ -76,6 +80,7 @@ input {
 	display: flex;
 	flex-direction: column;
 	height: 100%;
+	min-height: 0;
 	position: relative;
 	background: var(--bg);
 }
@@ -85,6 +90,8 @@ input {
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
+	border-bottom: 1px solid var(--border);
+	background: var(--bg);
 }
 
 .chat-header h1 {
@@ -103,24 +110,38 @@ input {
 .messages {
 	flex: 1;
 	overflow-y: auto;
-	padding: 20px 24px 120px; /* Bottom padding for composer */
+	padding: 20px 24px calc(120px + env(safe-area-inset-bottom)); /* Bottom padding for composer */
 	display: flex;
 	flex-direction: column;
 	gap: 24px;
 	max-width: 900px;
 	margin: 0 auto;
 	width: 100%;
+	min-height: 0;
+	-webkit-overflow-scrolling: touch;
+	overscroll-behavior: contain;
+	scroll-padding-bottom: calc(120px + env(safe-area-inset-bottom));
+	scrollbar-gutter: stable;
 }
 
 .msg {
 	display: flex;
 	gap: 16px;
+	width: 100%;
+	align-items: flex-start;
 }
 
 .msg-content {
-	flex: 1;
+	flex: 0 1 auto;
+	min-width: 0;
+	max-width: min(760px, 100%);
 	display: grid;
 	gap: 4px;
+	padding: 12px 14px;
+	border: 1px solid var(--border);
+	border-radius: 14px;
+	background: var(--panel);
+	box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
 }
 
 .msg .meta {
@@ -150,6 +171,19 @@ input {
 	color: var(--text);
 }
 
+.msg.user {
+	justify-content: flex-end;
+}
+
+.msg.user .msg-content {
+	background: rgba(26, 115, 232, 0.08);
+	border-color: rgba(26, 115, 232, 0.22);
+}
+
+.msg.user .meta strong {
+	color: var(--brand-2);
+}
+
 .system-intro {
 	flex-direction: column;
 	align-items: center;
@@ -174,7 +208,7 @@ input {
 /* Composer */
 .composer-wrapper {
 	position: absolute;
-	bottom: 24px;
+	bottom: calc(24px + env(safe-area-inset-bottom));
 	left: 50%;
 	transform: translateX(-50%);
 	width: 100%;
@@ -260,6 +294,10 @@ input {
 	flex-direction: column;
 	height: 100%;
 	overflow-y: auto;
+	min-height: 0;
+	-webkit-overflow-scrolling: touch;
+	overscroll-behavior: contain;
+	scrollbar-gutter: stable;
 }
 
 .panel-header {
@@ -411,6 +449,7 @@ input {
 
 .app-shell {
 	height: 100vh;
+	height: 100dvh;
 	overflow: hidden;
 }
 

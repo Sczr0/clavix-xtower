@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tick } from 'svelte';
 	import { streamSse, type SseEvent } from '$lib/sse';
 
 	type Provider = 'openai' | 'anthropic';
@@ -41,7 +42,33 @@
 	let lastEvent = $state<string | null>(null);
 	let error = $state<string | null>(null);
 
+	let messagesEl: HTMLDivElement | null = null;
+	let stickToBottom = $state(true);
+
 	let abortController: AbortController | null = null;
+
+	function syncStickToBottom() {
+		if (!messagesEl) return;
+		const thresholdPx = 80;
+		const remaining = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
+		stickToBottom = remaining < thresholdPx;
+	}
+
+	async function scrollMessagesToBottom() {
+		await tick();
+		if (!messagesEl) return;
+		messagesEl.scrollTop = messagesEl.scrollHeight;
+	}
+
+	$effect(() => {
+		// 依赖：消息/草稿/流式状态变化时，若用户在底部附近则自动跟随滚动
+		messages.length;
+		assistantDraft;
+		streaming;
+
+		if (!stickToBottom) return;
+		void scrollMessagesToBottom();
+	});
 
 	function resetForProvider(next: Provider) {
 		baseUrl = DEFAULTS[next].baseUrl;
@@ -69,6 +96,7 @@
 		assistantDraft = '';
 		error = null;
 		lastEvent = null;
+		stickToBottom = true;
 	}
 
 	function parseProxyErrorEvent(event: SseEvent): UpstreamError | null {
@@ -130,6 +158,7 @@
 			return;
 		}
 
+		stickToBottom = true;
 		push('user', prompt.trim());
 		prompt = '';
 		assistantDraft = '';
@@ -220,7 +249,7 @@
 				</p>
 			</div>
 
-			<div class="messages">
+			<div class="messages" bind:this={messagesEl} onscroll={syncStickToBottom}>
 				{#if error}
 					<div class="error">{error}</div>
 				{/if}
