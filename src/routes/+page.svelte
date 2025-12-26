@@ -27,11 +27,18 @@
 	type Provider = 'openai' | 'anthropic';
 	type Role = 'user' | 'assistant';
 
+	type TokenUsage = {
+		inputTokens?: number;
+		outputTokens?: number;
+		totalTokens?: number;
+	};
+
 	type ChatMessage = {
 		id: string;
 		role: Role;
 		content: string;
 		thinking?: string;
+		usage?: TokenUsage;
 		at: number;
 	};
 
@@ -122,6 +129,7 @@
 			maxTokens: number;
 			showThinking: boolean;
 			thinkingAutoExpand: boolean;
+			includeUsage: boolean;
 		};
 	};
 
@@ -194,7 +202,8 @@
 					systemPrompt: safeString(common.systemPrompt, ''),
 					maxTokens: Math.max(1, Math.floor(safeNumber(common.maxTokens, 1024))),
 					showThinking: safeBoolean(common.showThinking, false),
-					thinkingAutoExpand: safeBoolean(common.thinkingAutoExpand, false)
+					thinkingAutoExpand: safeBoolean(common.thinkingAutoExpand, false),
+					includeUsage: safeBoolean(common.includeUsage, true)
 				}
 			};
 		} catch {
@@ -283,8 +292,10 @@
 	let messages = $state<ChatMessage[]>([]);
 	let assistantDraft = $state('');
 	let assistantThinkingDraft = $state('');
+	let streamingUsage = $state<TokenUsage | null>(null);
 	let streaming = $state(false);
 	let lastEvent = $state<string | null>(null);
+	let notice = $state<string | null>(null);
 	let error = $state<string | null>(null);
 
 	let settingsHydrated = $state(false);
@@ -299,6 +310,7 @@
 	};
 	let lastProvider: Provider = 'openai';
 	let saveTimer: number | null = null;
+	let noticeTimer: number | null = null;
 
 	let settingsOpen = $state(false);
 	let conversationsOpen = $state(false);
@@ -310,6 +322,7 @@
 
 	let showThinking = $state(false);
 	let thinkingAutoExpand = $state(false);
+	let includeUsage = $state(true);
 	let thinkingVisibleById = $state<Record<string, boolean>>({});
 	let thinkingOpenById = $state<Record<string, boolean>>({});
 	let streamingThinkingVisible = $state(false);
@@ -1016,6 +1029,7 @@
 			maxTokens = saved.common.maxTokens;
 			showThinking = saved.common.showThinking;
 			thinkingAutoExpand = saved.common.thinkingAutoExpand;
+			includeUsage = saved.common.includeUsage;
 
 			provider = saved.provider;
 			lastProvider = provider;
@@ -1100,6 +1114,7 @@
 		anthropicVersion;
 		showThinking;
 		thinkingAutoExpand;
+		includeUsage;
 
 		if (saveTimer) window.clearTimeout(saveTimer);
 		saveTimer = window.setTimeout(() => {
@@ -1113,7 +1128,8 @@
 					systemPrompt,
 					maxTokens: Math.max(1, Math.floor(Number.isFinite(maxTokens) ? maxTokens : 1024)),
 					showThinking,
-					thinkingAutoExpand
+					thinkingAutoExpand,
+					includeUsage
 				}
 			});
 		}, 250);
@@ -1137,9 +1153,63 @@
 		return `${(n / (1024 * 1024)).toFixed(2)} MB`;
 	}
 
-	function push(role: Role, content: string, thinking?: string) {
+	function showNotice(message: string) {
+		notice = message;
+		if (noticeTimer) window.clearTimeout(noticeTimer);
+		noticeTimer = window.setTimeout(() => {
+			notice = null;
+			noticeTimer = null;
+		}, 6_000);
+	}
+
+	function looksLikeUsageUnsupportedError(err: UpstreamError) {
+		const raw = typeof err?.message === 'string' ? err.message : '';
+		const msg = raw.toLowerCase();
+		return msg.includes('stream_options') || msg.includes('include_usage');
+	}
+
+	function mergeTokenUsage(current: TokenUsage | null, patch: TokenUsage | undefined): TokenUsage | null {
+		if (!patch) return current;
+		const next: TokenUsage = current ? { ...current } : {};
+
+		if (typeof patch.inputTokens === 'number') {
+			next.inputTokens = typeof next.inputTokens === 'number' ? Math.max(next.inputTokens, patch.inputTokens) : patch.inputTokens;
+		}
+		if (typeof patch.outputTokens === 'number') {
+			next.outputTokens =
+				typeof next.outputTokens === 'number' ? Math.max(next.outputTokens, patch.outputTokens) : patch.outputTokens;
+		}
+		if (typeof patch.totalTokens === 'number') {
+			next.totalTokens = typeof next.totalTokens === 'number' ? Math.max(next.totalTokens, patch.totalTokens) : patch.totalTokens;
+		}
+
+		if (typeof next.totalTokens !== 'number' && typeof next.inputTokens === 'number' && typeof next.outputTokens === 'number') {
+			next.totalTokens = next.inputTokens + next.outputTokens;
+		}
+
+		return Object.keys(next).length ? next : null;
+	}
+
+	function formatTokenUsage(usage: TokenUsage | null | undefined): string | null {
+		if (!usage) return null;
+		const parts: string[] = [];
+		if (typeof usage.inputTokens === 'number') parts.push(`输入 ${usage.inputTokens}`);
+		if (typeof usage.outputTokens === 'number') parts.push(`输出 ${usage.outputTokens}`);
+
+		const total =
+			typeof usage.totalTokens === 'number'
+				? usage.totalTokens
+				: typeof usage.inputTokens === 'number' && typeof usage.outputTokens === 'number'
+					? usage.inputTokens + usage.outputTokens
+					: null;
+		if (typeof total === 'number') parts.push(`总计 ${total}`);
+
+		return parts.length ? `Tokens：${parts.join(' · ')}` : null;
+	}
+
+	function push(role: Role, content: string, thinking?: string, usage?: TokenUsage) {
 		const id = typeof crypto?.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
-		messages.push({ id, role, content, thinking, at: Date.now() });
+		messages.push({ id, role, content, thinking, usage, at: Date.now() });
 		touchCurrentConversation();
 	}
 
@@ -1152,10 +1222,14 @@
 		messages = [];
 		assistantDraft = '';
 		assistantThinkingDraft = '';
+		streamingUsage = null;
 		thinkingVisibleById = {};
 		thinkingOpenById = {};
 		streamingThinkingVisible = false;
 		streamingThinkingOpen = false;
+		notice = null;
+		if (noticeTimer) window.clearTimeout(noticeTimer);
+		noticeTimer = null;
 		error = null;
 		lastEvent = null;
 		stickToBottom = true;
@@ -1175,7 +1249,8 @@
 	}
 
 	function applyOpenAiDelta(event: SseEvent) {
-		const { done, contentDelta, thinkingDelta } = parseOpenAiSseData(event.data);
+		const { done, contentDelta, thinkingDelta, usage } = parseOpenAiSseData(event.data);
+		if (usage) streamingUsage = mergeTokenUsage(streamingUsage, usage);
 		if (done) return false;
 
 		if (typeof thinkingDelta === 'string' && thinkingDelta) assistantThinkingDraft += thinkingDelta;
@@ -1190,7 +1265,8 @@
 	}
 
 	function applyAnthropicDelta(event: SseEvent) {
-		const { contentDelta, thinkingDelta } = parseAnthropicSseEvent(event, anthropicCtx);
+		const { contentDelta, thinkingDelta, usage } = parseAnthropicSseEvent(event, anthropicCtx);
+		if (usage) streamingUsage = mergeTokenUsage(streamingUsage, usage);
 
 		if (typeof thinkingDelta === 'string' && thinkingDelta) assistantThinkingDraft += thinkingDelta;
 
@@ -1204,6 +1280,7 @@
 	}
 
 	async function send() {
+		notice = null;
 		error = null;
 		lastEvent = null;
 
@@ -1241,6 +1318,7 @@
 		prompt = '';
 		assistantDraft = '';
 		assistantThinkingDraft = '';
+		streamingUsage = null;
 		streamingThinkingVisible = false;
 		streamingThinkingOpen = false;
 		thoughtSplitter.reset();
@@ -1255,109 +1333,144 @@
 			const trimmedModel = model.trim();
 			const trimmedAnthropicVersion = provider === 'anthropic' ? anthropicVersion.trim() : undefined;
 
-			const request =
-				provider === 'openai'
-					? {
-							model: trimmedModel,
-							messages: [
-								...(systemPrompt.trim() ? [{ role: 'system', content: systemPrompt.trim() }] : []),
-								...messages.map((m) => ({ role: m.role, content: m.content }))
-							],
-							temperature: Number.isFinite(temperature) ? temperature : 0.7,
-							max_tokens: Number.isFinite(maxTokens) ? maxTokens : 1024,
-							stream: true
-						}
-					: {
-							model: trimmedModel,
-							system: systemPrompt.trim() ? systemPrompt.trim() : undefined,
-							messages: messages.map((m) => ({ role: m.role, content: [{ type: 'text', text: m.content }] })),
-							max_tokens: Number.isFinite(maxTokens) ? maxTokens : 1024,
-							stream: true
-						};
-
 			const origin = typeof location !== 'undefined' ? location.origin : '';
-			const proxyPayloadBase = {
-				provider,
-				baseUrl: trimmedBaseUrl,
-				anthropicVersion: trimmedAnthropicVersion,
-				request
-			};
-			const proxyPayload = { ...proxyPayloadBase, apiKey: trimmedApiKey };
 
-			debugSession = {
-				startedAt: Date.now(),
-				endedAt: null,
-				aborted: false,
-				provider,
-				baseUrl: trimmedBaseUrl,
-				model: trimmedModel,
-				anthropicVersion: trimmedAnthropicVersion,
-				upstreamUrl: buildUpstreamUrl(provider, trimmedBaseUrl),
-				proxyStatus: null,
-				proxyOk: null,
-				proxyErrorText: null,
-				firstEventAt: null,
-				eventCount: 0,
-				bytesApprox: 0,
-				events: [],
-				origin,
-				proxyPayloadBase,
-				proxyPayloadMaskedJson: prettyJson({ ...proxyPayloadBase, apiKey: maskApiKey(trimmedApiKey) }) || '{}',
-				upstreamRequestJson: prettyJson(request) || '{}',
-				proxyCurl: buildProxyCurl({ origin, payload: proxyPayload, includeKey: false }),
-				upstreamCurl: buildUpstreamCurl({
+			// 若上游不支持 OpenAI 的 stream_options.include_usage，本次会自动降级重试一次
+			let didRetryWithoutUsage = false;
+			debugSession = null;
+
+			while (true) {
+				const request =
+					provider === 'openai'
+						? {
+								model: trimmedModel,
+								messages: [
+									...(systemPrompt.trim() ? [{ role: 'system', content: systemPrompt.trim() }] : []),
+									...messages.map((m) => ({ role: m.role, content: m.content }))
+								],
+								temperature: Number.isFinite(temperature) ? temperature : 0.7,
+								max_tokens: Number.isFinite(maxTokens) ? maxTokens : 1024,
+								stream_options: includeUsage && !didRetryWithoutUsage ? { include_usage: true } : undefined,
+								stream: true
+							}
+						: {
+								model: trimmedModel,
+								system: systemPrompt.trim() ? systemPrompt.trim() : undefined,
+								messages: messages.map((m) => ({ role: m.role, content: [{ type: 'text', text: m.content }] })),
+								max_tokens: Number.isFinite(maxTokens) ? maxTokens : 1024,
+								stream: true
+							};
+
+				const proxyPayloadBase = {
 					provider,
 					baseUrl: trimmedBaseUrl,
-					apiKey: trimmedApiKey,
 					anthropicVersion: trimmedAnthropicVersion,
-					request,
-					includeKey: false
-				})
-			};
+					request
+				};
+				const proxyPayload = { ...proxyPayloadBase, apiKey: trimmedApiKey };
 
-			const res = await fetch('/api/chat', {
-				method: 'POST',
-				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify(proxyPayload),
-				signal: abortController.signal
-			});
+				if (!debugSession) {
+					debugSession = {
+						startedAt: Date.now(),
+						endedAt: null,
+						aborted: false,
+						provider,
+						baseUrl: trimmedBaseUrl,
+						model: trimmedModel,
+						anthropicVersion: trimmedAnthropicVersion,
+						upstreamUrl: buildUpstreamUrl(provider, trimmedBaseUrl),
+						proxyStatus: null,
+						proxyOk: null,
+						proxyErrorText: null,
+						firstEventAt: null,
+						eventCount: 0,
+						bytesApprox: 0,
+						events: [],
+						origin,
+						proxyPayloadBase,
+						proxyPayloadMaskedJson: prettyJson({ ...proxyPayloadBase, apiKey: maskApiKey(trimmedApiKey) }) || '{}',
+						upstreamRequestJson: prettyJson(request) || '{}',
+						proxyCurl: buildProxyCurl({ origin, payload: proxyPayload, includeKey: false }),
+						upstreamCurl: buildUpstreamCurl({
+							provider,
+							baseUrl: trimmedBaseUrl,
+							apiKey: trimmedApiKey,
+							anthropicVersion: trimmedAnthropicVersion,
+							request,
+							includeKey: false
+						})
+					};
+				}
 
-			if (debugSession) {
-				debugSession.proxyStatus = res.status;
-				debugSession.proxyOk = res.ok;
-			}
+				const res = await fetch('/api/chat', {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify(proxyPayload),
+					signal: abortController.signal
+				});
 
-			if (!res.ok) {
-				const text = await res.text().catch(() => '');
-				error = `代理请求失败（HTTP ${res.status}）${text ? `：${text}` : ''}`;
-				if (debugSession) debugSession.proxyErrorText = truncateText(text || `HTTP ${res.status}`, DEBUG_ERROR_SNIPPET_MAX);
-				openDebugPanel();
-				return;
-			}
+				if (debugSession) {
+					debugSession.proxyStatus = res.status;
+					debugSession.proxyOk = res.ok;
+				}
 
-			await streamSse(
-				res,
-				(event) => {
-					recordDebugEvent(event);
-					lastEvent = event.event;
+				if (!res.ok) {
+					const text = await res.text().catch(() => '');
+					error = `代理请求失败（HTTP ${res.status}）${text ? `：${text}` : ''}`;
+					if (debugSession) debugSession.proxyErrorText = truncateText(text || `HTTP ${res.status}`, DEBUG_ERROR_SNIPPET_MAX);
+					openDebugPanel();
+					return;
+				}
 
-					const proxyErr = parseProxyErrorEvent(event);
-					if (proxyErr) {
-						error = proxyErr.status ? `上游错误（HTTP ${proxyErr.status}）：${proxyErr.message}` : proxyErr.message;
-						if (debugSession) {
-							debugSession.proxyErrorText = truncateText(
-								proxyErr.status ? `HTTP ${proxyErr.status}: ${proxyErr.message}` : proxyErr.message,
-								DEBUG_ERROR_SNIPPET_MAX
-							);
+				let retryWithoutUsage = false;
+				await streamSse(
+					res,
+					(event) => {
+						recordDebugEvent(event);
+						lastEvent = event.event;
+
+						const proxyErr = parseProxyErrorEvent(event);
+						if (proxyErr) {
+							if (
+								provider === 'openai' &&
+								includeUsage &&
+								!didRetryWithoutUsage &&
+								proxyErr.status === 400 &&
+								looksLikeUsageUnsupportedError(proxyErr)
+							) {
+								retryWithoutUsage = true;
+								return false;
+							}
+
+							error = proxyErr.status ? `上游错误（HTTP ${proxyErr.status}）：${proxyErr.message}` : proxyErr.message;
+							if (debugSession) {
+								debugSession.proxyErrorText = truncateText(
+									proxyErr.status ? `HTTP ${proxyErr.status}: ${proxyErr.message}` : proxyErr.message,
+									DEBUG_ERROR_SNIPPET_MAX
+								);
+							}
+							openDebugPanel();
+							return false;
 						}
-						openDebugPanel();
-						return false;
-					}
 
-					return provider === 'openai' ? applyOpenAiDelta(event) : applyAnthropicDelta(event);
-				},
-				{ signal: abortController.signal }
-			);
+						return provider === 'openai' ? applyOpenAiDelta(event) : applyAnthropicDelta(event);
+					},
+					{ signal: abortController.signal }
+				);
+
+				if (retryWithoutUsage) {
+					didRetryWithoutUsage = true;
+					includeUsage = false;
+					showNotice('检测到上游不支持 Token 统计（stream_options.include_usage），已自动关闭并重试。本次回答将不显示 tokens。');
+					assistantDraft = '';
+					assistantThinkingDraft = '';
+					streamingUsage = null;
+					thoughtSplitter.reset();
+					continue;
+				}
+
+				break;
+			}
 		} catch (e) {
 			if (abortController.signal.aborted) {
 				error = '已停止。';
@@ -1382,12 +1495,14 @@
 
 			const finalText = assistantDraft.trim();
 			const finalThinking = assistantThinkingDraft.trim();
+			const finalUsage = streamingUsage ?? undefined;
 			if (finalText || finalThinking) {
-				push('assistant', finalText, finalThinking || undefined);
+				push('assistant', finalText, finalThinking || undefined, finalUsage);
 			}
 
 			assistantDraft = '';
 			assistantThinkingDraft = '';
+			streamingUsage = null;
 			streamingThinkingVisible = false;
 			streamingThinkingOpen = false;
 		}
@@ -1532,6 +1647,9 @@
 			</div>
 
 			<div class="messages" bind:this={messagesEl} onscroll={syncStickToBottom} use:delegateCopy>
+				{#if notice}
+					<div class="notice">{notice}</div>
+				{/if}
 				{#if error}
 					<div class="error">{error}</div>
 				{/if}
@@ -1566,6 +1684,11 @@
 							<div class="meta">
 								<strong>{m.role === 'user' ? '用户' : '助手'}</strong>
 								<span>{fmtTime(m.at)}</span>
+								{#if m.role === 'assistant' && formatTokenUsage(m.usage)}
+									<span class="meta-pill meta-pill-static" title="本次回答 Token 用量">
+										{formatTokenUsage(m.usage)}
+									</span>
+								{/if}
 								{#if m.role === 'assistant' && m.thinking?.trim()}
 									<button class="meta-pill" type="button" onclick={() => toggleMessageThinking(m.id)}>
 										{showThinking
@@ -1603,6 +1726,11 @@
 							<div class="meta">
 								<strong>助手</strong>
 								<span class="ok">生成中...</span>
+								{#if formatTokenUsage(streamingUsage)}
+									<span class="meta-pill meta-pill-static" title="本次回答 Token 用量">
+										{formatTokenUsage(streamingUsage)}
+									</span>
+								{/if}
 								{#if assistantThinkingDraft.trim()}
 									<button class="meta-pill" type="button" onclick={toggleStreamingThinking}>
 										{showThinking
@@ -1783,6 +1911,10 @@
 									disabled={!showThinking}
 								/>
 								<span>默认展开</span>
+							</label>
+							<label class="checkbox">
+								<input id="includeUsage" type="checkbox" bind:checked={includeUsage} />
+								<span>显示 Token 用量（需要上游支持 usage；OpenAI 会尝试 stream_options.include_usage）</span>
 							</label>
 						</div>
 					</div>

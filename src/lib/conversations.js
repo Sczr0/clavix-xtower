@@ -17,10 +17,17 @@
  * @typedef {'user' | 'assistant'} Role
  *
  * @typedef {{
+ *   inputTokens?: number;
+ *   outputTokens?: number;
+ *   totalTokens?: number;
+ * }} TokenUsage
+ *
+ * @typedef {{
  *   id: string;
  *   role: Role;
  *   content: string;
  *   thinking?: string;
+ *   usage?: TokenUsage;
  *   at: number;
  * }} ChatMessage
  *
@@ -222,6 +229,39 @@ function normalizeRunSnapshot(raw) {
 }
 
 /**
+ * @param {unknown} v
+ */
+function normalizeNonNegativeInt(v) {
+	const n = typeof v === 'number' ? v : Number(v);
+	if (!Number.isFinite(n) || n < 0) return undefined;
+	return Math.floor(n);
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {TokenUsage | undefined}
+ */
+function normalizeTokenUsage(raw) {
+	if (!raw || typeof raw !== 'object') return undefined;
+	const u = /** @type {any} */ (raw);
+
+	const inputTokens = normalizeNonNegativeInt(u.inputTokens ?? u.input_tokens ?? u.prompt_tokens);
+	const outputTokens = normalizeNonNegativeInt(u.outputTokens ?? u.output_tokens ?? u.completion_tokens);
+	const totalTokens = normalizeNonNegativeInt(u.totalTokens ?? u.total_tokens);
+
+	/** @type {TokenUsage} */
+	const out = {};
+	if (typeof inputTokens === 'number') out.inputTokens = inputTokens;
+	if (typeof outputTokens === 'number') out.outputTokens = outputTokens;
+	if (typeof totalTokens === 'number') out.totalTokens = totalTokens;
+	if (typeof out.totalTokens !== 'number' && typeof out.inputTokens === 'number' && typeof out.outputTokens === 'number') {
+		out.totalTokens = out.inputTokens + out.outputTokens;
+	}
+
+	return Object.keys(out).length ? out : undefined;
+}
+
+/**
  * @param {unknown} raw
  * @returns {{ ok: true; messages: ChatMessage[] } | { ok: false; error: string }}
  */
@@ -245,6 +285,7 @@ function normalizeMessages(raw) {
 		const content = m.content;
 
 		const thinking = typeof m.thinking === 'string' ? m.thinking : undefined;
+		const usage = normalizeTokenUsage(m.usage);
 		const at = safeNumber(m.at, Date.now());
 		const id = typeof m.id === 'string' && m.id.trim() ? m.id : createId();
 
@@ -254,7 +295,7 @@ function normalizeMessages(raw) {
 		totalChars += content.length + (thinking?.length ?? 0);
 		if (totalChars > LIMITS.maxImportTotalChars) return { ok: false, error: '导入内容过大（总字符数超限）' };
 
-		out.push({ id, role, content, thinking, at: Math.floor(at) });
+		out.push({ id, role, content, thinking, usage, at: Math.floor(at) });
 	}
 
 	return { ok: true, messages: out };
@@ -505,6 +546,24 @@ export function renderConversationMarkdown(meta, detail) {
 		const roleLabel = m.role === 'user' ? 'User' : 'Assistant';
 		lines.push(`## ${roleLabel} (${new Date(m.at).toISOString()})`);
 		lines.push('');
+
+		if (m.role === 'assistant' && m.usage) {
+			const parts = [];
+			if (typeof m.usage.inputTokens === 'number') parts.push(`in=${m.usage.inputTokens}`);
+			if (typeof m.usage.outputTokens === 'number') parts.push(`out=${m.usage.outputTokens}`);
+			const total =
+				typeof m.usage.totalTokens === 'number'
+					? m.usage.totalTokens
+					: typeof m.usage.inputTokens === 'number' && typeof m.usage.outputTokens === 'number'
+						? m.usage.inputTokens + m.usage.outputTokens
+						: null;
+			if (typeof total === 'number') parts.push(`total=${total}`);
+			if (parts.length) {
+				lines.push(`- tokens: ${parts.join(', ')}`);
+				lines.push('');
+			}
+		}
+
 		lines.push(m.content || '');
 		lines.push('');
 	}

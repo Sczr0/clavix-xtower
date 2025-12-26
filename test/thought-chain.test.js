@@ -33,6 +33,16 @@ test('parseOpenAiSseData: extracts old completions text', () => {
 	assert.equal(out.thinkingDelta, '');
 });
 
+test('parseOpenAiSseData: extracts usage', () => {
+	const out = parseOpenAiSseData(
+		JSON.stringify({
+			choices: [{ delta: {} }],
+			usage: { prompt_tokens: 12, completion_tokens: 34, total_tokens: 46 }
+		})
+	);
+	assert.deepEqual(out.usage, { inputTokens: 12, outputTokens: 34, totalTokens: 46 });
+});
+
 test('createThoughtChainSplitter: splits <think> across chunks', () => {
 	const splitter = createThoughtChainSplitter();
 
@@ -79,4 +89,13 @@ test('parseAnthropicSseEvent: routes deltas by block type', () => {
 	out = parseAnthropicSseEvent({ event: 'content_block_delta', id: null, data: JSON.stringify({ index: 1, delta: { text: 'hi' } }) }, ctx);
 	assert.equal(out.contentDelta, 'hi');
 	assert.equal(out.thinkingDelta, '');
+});
+
+test('parseAnthropicSseEvent: extracts usage from message_start', () => {
+	const ctx = createAnthropicSseContext();
+	const out = parseAnthropicSseEvent(
+		{ event: 'message_start', id: null, data: JSON.stringify({ message: { usage: { input_tokens: 9, output_tokens: 0 } } }) },
+		ctx
+	);
+	assert.deepEqual(out.usage, { inputTokens: 9, outputTokens: 0, totalTokens: 9 });
 });

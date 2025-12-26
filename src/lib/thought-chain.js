@@ -13,6 +13,14 @@ const DEFAULT_OPEN_TAGS = ['<think>', '<analysis>'];
 const DEFAULT_CLOSE_TAGS = ['</think>', '</analysis>'];
 
 /**
+ * @typedef {{
+ *   inputTokens?: number;
+ *   outputTokens?: number;
+ *   totalTokens?: number;
+ * }} TokenUsage
+ */
+
+/**
  * @typedef {'open' | 'close'} TagKind
  * @typedef {{ index: number; tag: string; kind: TagKind }} TagHit
  */
@@ -141,15 +149,25 @@ export function createThoughtChainSplitter(options = {}) {
 }
 
 /**
+ * @param {unknown} v
+ */
+function normalizeNonNegativeInt(v) {
+	const n = typeof v === 'number' ? v : Number(v);
+	if (!Number.isFinite(n) || n < 0) return undefined;
+	return Math.floor(n);
+}
+
+/**
  * OpenAI Compatible：从单条 SSE data 字符串中提取正文/思维链增量。
  *
  * 兼容场景：
  * - 标准：choices[0].delta.content
  * - 兼容旧格式：choices[0].text
  * - 常见“思维链字段”：choices[0].delta.reasoning / delta.reasoning_content / delta.thinking
+ * - Token 用量（如上游支持）：usage.prompt_tokens / usage.completion_tokens / usage.total_tokens
  *
  * @param {string} data
- * @returns {{ done: boolean; contentDelta: string; thinkingDelta: string }}
+ * @returns {{ done: boolean; contentDelta: string; thinkingDelta: string; usage?: TokenUsage }}
  */
 export function parseOpenAiSseData(data) {
 	if (data === '[DONE]') return { done: true, contentDelta: '', thinkingDelta: '' };
@@ -157,6 +175,28 @@ export function parseOpenAiSseData(data) {
 
 	try {
 		const parsed = JSON.parse(data);
+		const usageRaw = parsed?.usage;
+		const usage =
+			usageRaw && typeof usageRaw === 'object'
+				? (() => {
+						const u = /** @type {any} */ (usageRaw);
+						const inputTokens = normalizeNonNegativeInt(u.prompt_tokens ?? u.input_tokens);
+						const outputTokens = normalizeNonNegativeInt(u.completion_tokens ?? u.output_tokens);
+						const totalTokens = normalizeNonNegativeInt(u.total_tokens ?? u.total);
+
+						/** @type {TokenUsage} */
+						const out = {};
+						if (typeof inputTokens === 'number') out.inputTokens = inputTokens;
+						if (typeof outputTokens === 'number') out.outputTokens = outputTokens;
+						if (typeof totalTokens === 'number') out.totalTokens = totalTokens;
+						if (typeof out.totalTokens !== 'number' && typeof out.inputTokens === 'number' && typeof out.outputTokens === 'number') {
+							out.totalTokens = out.inputTokens + out.outputTokens;
+						}
+
+						return Object.keys(out).length ? out : undefined;
+					})()
+				: undefined;
+
 		const choice = parsed?.choices?.[0] ?? {};
 		const delta = choice?.delta ?? {};
 
@@ -171,7 +211,10 @@ export function parseOpenAiSseData(data) {
 						? delta.thinking
 						: '';
 
-		return { done: false, contentDelta, thinkingDelta };
+		/** @type {{ done: boolean; contentDelta: string; thinkingDelta: string; usage?: TokenUsage }} */
+		const out = { done: false, contentDelta, thinkingDelta };
+		if (usage) out.usage = usage;
+		return out;
 	} catch {
 		// 上游偶尔会插入不可解析片段；按“无增量”处理
 		return { done: false, contentDelta: '', thinkingDelta: '' };
@@ -198,26 +241,59 @@ export function createAnthropicSseContext() {
  * - 先通过 content_block_start 记录 index -> content_block.type
  * - content_block_delta 根据 index 的 type 决定落到正文还是思维链
  * - 同时做 shape-based 兜底（delta.text / delta.thinking 等）
+ * - Token 用量（如上游返回）：message.usage 或 usage（input_tokens/output_tokens）
  *
  * @param {SseEvent} event
  * @param {AnthropicSseContext} ctx
- * @returns {{ contentDelta: string; thinkingDelta: string }}
+ * @returns {{ contentDelta: string; thinkingDelta: string; usage?: TokenUsage }}
  */
 export function parseAnthropicSseEvent(event, ctx) {
 	if (!event?.data) return { contentDelta: '', thinkingDelta: '' };
 
 	try {
 		const parsed = JSON.parse(event.data);
+		const usage =
+			(() => {
+				const candidates = [parsed?.usage, parsed?.message?.usage, parsed?.delta?.usage];
+				for (const raw of candidates) {
+					if (!raw || typeof raw !== 'object') continue;
+					const u = /** @type {any} */ (raw);
+					const inputTokens = normalizeNonNegativeInt(u.input_tokens ?? u.prompt_tokens ?? u.inputTokens);
+					const outputTokens = normalizeNonNegativeInt(u.output_tokens ?? u.completion_tokens ?? u.outputTokens);
+					const totalTokens = normalizeNonNegativeInt(u.total_tokens ?? u.totalTokens);
+
+					/** @type {TokenUsage} */
+					const out = {};
+					if (typeof inputTokens === 'number') out.inputTokens = inputTokens;
+					if (typeof outputTokens === 'number') out.outputTokens = outputTokens;
+					if (typeof totalTokens === 'number') out.totalTokens = totalTokens;
+					if (typeof out.totalTokens !== 'number' && typeof out.inputTokens === 'number' && typeof out.outputTokens === 'number') {
+						out.totalTokens = out.inputTokens + out.outputTokens;
+					}
+					if (Object.keys(out).length) return out;
+				}
+				return undefined;
+			})();
+
 		const type = String(event.event ?? parsed?.type ?? '');
 
 		if (type === 'content_block_start') {
 			const index = parsed?.index;
 			const blockType = parsed?.content_block?.type;
 			if (Number.isInteger(index) && typeof blockType === 'string') ctx.blockTypes.set(index, blockType);
-			return { contentDelta: '', thinkingDelta: '' };
+
+			/** @type {{ contentDelta: string; thinkingDelta: string; usage?: TokenUsage }} */
+			const out = { contentDelta: '', thinkingDelta: '' };
+			if (usage) out.usage = usage;
+			return out;
 		}
 
-		if (type !== 'content_block_delta') return { contentDelta: '', thinkingDelta: '' };
+		if (type !== 'content_block_delta') {
+			/** @type {{ contentDelta: string; thinkingDelta: string; usage?: TokenUsage }} */
+			const out = { contentDelta: '', thinkingDelta: '' };
+			if (usage) out.usage = usage;
+			return out;
+		}
 
 		const index = parsed?.index;
 		const blockType = Number.isInteger(index) ? ctx.blockTypes.get(index) : undefined;
@@ -248,8 +324,13 @@ export function parseAnthropicSseEvent(event, ctx) {
 		const isThinkingBlock =
 			blockType === 'thinking' || blockType === 'redacted_thinking' || blockType === 'thinking_summary';
 
-		if (isThinkingBlock) return { contentDelta: '', thinkingDelta: thinkingDelta || textDelta };
-		return { contentDelta: textDelta, thinkingDelta };
+		/** @type {{ contentDelta: string; thinkingDelta: string; usage?: TokenUsage }} */
+		const out = isThinkingBlock
+			? { contentDelta: '', thinkingDelta: thinkingDelta || textDelta }
+			: { contentDelta: textDelta, thinkingDelta };
+
+		if (usage) out.usage = usage;
+		return out;
 	} catch {
 		return { contentDelta: '', thinkingDelta: '' };
 	}

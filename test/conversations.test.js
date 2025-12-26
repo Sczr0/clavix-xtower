@@ -116,3 +116,17 @@ test('parseConversationImport: rejects too many messages', () => {
 	assert.equal(res.ok, false);
 });
 
+test('parseConversationImport: preserves token usage on messages', () => {
+	const raw = JSON.stringify({
+		v: 1,
+		messages: [
+			{ id: 'm1', role: 'assistant', content: 'hi', at: 1, usage: { inputTokens: 12, outputTokens: 34, totalTokens: 46 } }
+		]
+	});
+
+	const res = parseConversationImport(raw, 123);
+	assert.equal(res.ok, true);
+	if (!res.ok) return;
+
+	assert.deepEqual(res.detail.messages[0].usage, { inputTokens: 12, outputTokens: 34, totalTokens: 46 });
+});

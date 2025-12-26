@@ -326,6 +326,16 @@ button.link:hover {
 	color: var(--brand-2);
 }
 
+.msg .meta .meta-pill.meta-pill-static {
+	cursor: default;
+}
+
+.msg .meta .meta-pill.meta-pill-static:hover {
+	border-color: var(--border);
+	background: var(--bg);
+	color: var(--muted);
+}
+
 .md {
 	min-width: 0;
 	color: var(--text);
@@ -1134,6 +1144,16 @@ button.link:hover {
 .btn[disabled] {
 	opacity: 0.5;
 	cursor: not-allowed;
+}
+
+.notice {
+	padding: 12px;
+	border-radius: 8px;
+	background: rgba(26, 115, 232, 0.08);
+	border: 1px solid rgba(26, 115, 232, 0.18);
+	color: var(--brand-2);
+	font-size: 13px;
+	margin-bottom: 16px;
 }
 
 .error {
