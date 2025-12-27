@@ -352,6 +352,8 @@
 	let streamingThinkingOpen = $state(false);
 
 	let messagesEl: HTMLDivElement | null = null;
+	let chatAreaEl: HTMLElement | null = null;
+	let composerWrapperEl: HTMLDivElement | null = null;
 	let stickToBottom = $state(true);
 	const MAX_RENDER_MESSAGES = 200;
 	let renderAllMessages = $state(false);
@@ -992,6 +994,38 @@
 		messagesEl.scrollTop = messagesEl.scrollHeight;
 	}
 
+	let composerOverlapRaf: number | null = null;
+
+	function parsePx(value: string) {
+		const n = Number.parseFloat(value);
+		return Number.isFinite(n) ? n : 0;
+	}
+
+	function updateComposerOverlap() {
+		if (!chatAreaEl || !composerWrapperEl) return;
+
+		const chatRect = chatAreaEl.getBoundingClientRect();
+		if (!Number.isFinite(chatRect.height) || chatRect.height <= 0) return;
+
+		const composerRect = composerWrapperEl.getBoundingClientRect();
+		const overlay = Math.max(0, Math.ceil(chatRect.bottom - composerRect.top));
+		const base = parsePx(getComputedStyle(chatAreaEl).getPropertyValue('--composer-overlap-base'));
+
+		// 仅当实际遮挡高度超过 CSS 默认值时才抬高，避免在“正常高度”下产生额外空白
+		const next = overlay > base ? overlay + 12 : base;
+		chatAreaEl.style.setProperty('--composer-overlap', `${Math.min(next, Math.ceil(chatRect.height))}px`);
+
+		if (stickToBottom) void scrollMessagesToBottom();
+	}
+
+	function scheduleComposerOverlapUpdate() {
+		if (composerOverlapRaf != null) return;
+		composerOverlapRaf = window.requestAnimationFrame(() => {
+			composerOverlapRaf = null;
+			updateComposerOverlap();
+		});
+	}
+
 	$effect(() => {
 		// 依赖：消息/草稿/流式状态变化时，若用户在底部附近则自动跟随滚动
 		messages.length;
@@ -1139,6 +1173,27 @@
 		settingsHydrated = true;
 
 		return () => window.removeEventListener('resize', handleResize);
+	});
+
+	onMount(() => {
+		// 解决“长回答被输入框遮挡”：按实际 composer 位置动态调整 messages 的 bottom padding
+		scheduleComposerOverlapUpdate();
+
+		let ro: ResizeObserver | null = null;
+		if (typeof ResizeObserver !== 'undefined' && chatAreaEl && composerWrapperEl) {
+			ro = new ResizeObserver(() => scheduleComposerOverlapUpdate());
+			ro.observe(chatAreaEl);
+			ro.observe(composerWrapperEl);
+		}
+
+		window.addEventListener('resize', scheduleComposerOverlapUpdate);
+
+		return () => {
+			window.removeEventListener('resize', scheduleComposerOverlapUpdate);
+			ro?.disconnect();
+			if (composerOverlapRaf != null) window.cancelAnimationFrame(composerOverlapRaf);
+			composerOverlapRaf = null;
+		};
 	});
 
 	$effect(() => {
@@ -1680,7 +1735,7 @@
 			onpointerdown={(e) => startSidebarResize('left', e)}
 		></div>
 
-		<section class="chat-area">
+		<section class="chat-area" bind:this={chatAreaEl}>
 			<div class="chat-header">
 				<div class="chat-title">
 					<h1>EdgeAI Playground</h1>
@@ -1822,7 +1877,7 @@
 				</button>
 			{/if}
 
-			<div class="composer-wrapper">
+			<div class="composer-wrapper" bind:this={composerWrapperEl}>
 				<div class="composer">
 					<textarea
 						id="prompt"
