@@ -89,6 +89,9 @@ test('serializeConversationExport: does not include apiKey', () => {
 			model: 'gpt-4o-mini',
 			systemPrompt: '',
 			temperature: 0.7,
+			topP: 0.9,
+			presencePenalty: 0.2,
+			frequencyPenalty: -0.1,
 			maxTokens: 1024,
 			anthropicVersion: '2023-06-01'
 		}
@@ -129,4 +132,40 @@ test('parseConversationImport: preserves token usage on messages', () => {
 	if (!res.ok) return;
 
 	assert.deepEqual(res.detail.messages[0].usage, { inputTokens: 12, outputTokens: 34, totalTokens: 46 });
+});
+
+test('parseConversationImport: preserves run snapshot sampling params', () => {
+	const raw = JSON.stringify({
+		v: 1,
+		messages: [{ id: 'm1', role: 'user', content: 'hi', at: 1 }],
+		run: {
+			provider: 'openai',
+			baseUrl: 'https://api.openai.com',
+			model: 'gpt-4o-mini',
+			systemPrompt: '',
+			temperature: '0.8',
+			top_p: '0.75',
+			presence_penalty: '1.2',
+			frequency_penalty: '-0.4',
+			maxTokens: '123',
+			anthropicVersion: '2023-06-01'
+		}
+	});
+
+	const res = parseConversationImport(raw, 123);
+	assert.equal(res.ok, true);
+	if (!res.ok) return;
+
+	assert.deepEqual(res.detail.run, {
+		provider: 'openai',
+		baseUrl: 'https://api.openai.com',
+		model: 'gpt-4o-mini',
+		systemPrompt: '',
+		temperature: 0.8,
+		topP: 0.75,
+		presencePenalty: 1.2,
+		frequencyPenalty: -0.4,
+		maxTokens: 123,
+		anthropicVersion: '2023-06-01'
+	});
 });

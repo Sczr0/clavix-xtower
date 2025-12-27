@@ -48,6 +48,9 @@
 		model: string;
 		systemPrompt: string;
 		temperature: number;
+		topP: number;
+		presencePenalty: number;
+		frequencyPenalty: number;
 		maxTokens: number;
 		anthropicVersion: string;
 	};
@@ -115,7 +118,14 @@
 	};
 
 	type ProviderCache = {
-		openai: { baseUrl: string; model: string; temperature: number };
+		openai: {
+			baseUrl: string;
+			model: string;
+			temperature: number;
+			topP: number;
+			presencePenalty: number;
+			frequencyPenalty: number;
+		};
 		anthropic: { baseUrl: string; model: string; anthropicVersion: string };
 	};
 
@@ -191,7 +201,10 @@
 				openai: {
 					baseUrl: safeString(openai.baseUrl, DEFAULTS.openai.baseUrl),
 					model: safeString(openai.model, ''),
-					temperature: clamp(safeNumber(openai.temperature, 0.7), 0, 2)
+					temperature: clamp(safeNumber(openai.temperature, 0.7), 0, 2),
+					topP: clamp(safeNumber(openai.topP ?? openai.top_p, 1), 0, 1),
+					presencePenalty: clamp(safeNumber(openai.presencePenalty ?? openai.presence_penalty, 0), -2, 2),
+					frequencyPenalty: clamp(safeNumber(openai.frequencyPenalty ?? openai.frequency_penalty, 0), -2, 2)
 				},
 				anthropic: {
 					baseUrl: safeString(anthropic.baseUrl, DEFAULTS.anthropic.baseUrl),
@@ -285,6 +298,9 @@
 	let model = $state('');
 	let systemPrompt = $state('');
 	let temperature = $state(0.7);
+	let topP = $state(1);
+	let presencePenalty = $state(0);
+	let frequencyPenalty = $state(0);
 	let maxTokens = $state(1024);
 	let anthropicVersion = $state(DEFAULTS.anthropic.version ?? '2023-06-01');
 
@@ -301,7 +317,14 @@
 	let settingsHydrated = $state(false);
 
 	let providerCache: ProviderCache = {
-		openai: { baseUrl: DEFAULTS.openai.baseUrl, model: '', temperature: 0.7 },
+		openai: {
+			baseUrl: DEFAULTS.openai.baseUrl,
+			model: '',
+			temperature: 0.7,
+			topP: 1,
+			presencePenalty: 0,
+			frequencyPenalty: 0
+		},
 		anthropic: {
 			baseUrl: DEFAULTS.anthropic.baseUrl,
 			model: '',
@@ -985,6 +1008,9 @@
 			providerCache.openai.baseUrl = baseUrl;
 			providerCache.openai.model = model;
 			providerCache.openai.temperature = clamp(Number.isFinite(temperature) ? temperature : 0.7, 0, 2);
+			providerCache.openai.topP = clamp(Number.isFinite(topP) ? topP : 1, 0, 1);
+			providerCache.openai.presencePenalty = clamp(Number.isFinite(presencePenalty) ? presencePenalty : 0, -2, 2);
+			providerCache.openai.frequencyPenalty = clamp(Number.isFinite(frequencyPenalty) ? frequencyPenalty : 0, -2, 2);
 		} else {
 			providerCache.anthropic.baseUrl = baseUrl;
 			providerCache.anthropic.model = model;
@@ -997,6 +1023,17 @@
 			baseUrl = providerCache.openai.baseUrl || DEFAULTS.openai.baseUrl;
 			model = providerCache.openai.model || '';
 			temperature = clamp(Number.isFinite(providerCache.openai.temperature) ? providerCache.openai.temperature : 0.7, 0, 2);
+			topP = clamp(Number.isFinite(providerCache.openai.topP) ? providerCache.openai.topP : 1, 0, 1);
+			presencePenalty = clamp(
+				Number.isFinite(providerCache.openai.presencePenalty) ? providerCache.openai.presencePenalty : 0,
+				-2,
+				2
+			);
+			frequencyPenalty = clamp(
+				Number.isFinite(providerCache.openai.frequencyPenalty) ? providerCache.openai.frequencyPenalty : 0,
+				-2,
+				2
+			);
 			return;
 		}
 
@@ -1015,15 +1052,18 @@
 	}
 
 	onMount(() => {
-		const saved = readSettings();
-		if (saved) {
-			providerCache.openai.baseUrl = saved.openai.baseUrl;
-			providerCache.openai.model = saved.openai.model;
-			providerCache.openai.temperature = saved.openai.temperature;
+			const saved = readSettings();
+			if (saved) {
+				providerCache.openai.baseUrl = saved.openai.baseUrl;
+				providerCache.openai.model = saved.openai.model;
+				providerCache.openai.temperature = saved.openai.temperature;
+				providerCache.openai.topP = saved.openai.topP;
+				providerCache.openai.presencePenalty = saved.openai.presencePenalty;
+				providerCache.openai.frequencyPenalty = saved.openai.frequencyPenalty;
 
-			providerCache.anthropic.baseUrl = saved.anthropic.baseUrl;
-			providerCache.anthropic.model = saved.anthropic.model;
-			providerCache.anthropic.anthropicVersion = saved.anthropic.anthropicVersion;
+				providerCache.anthropic.baseUrl = saved.anthropic.baseUrl;
+				providerCache.anthropic.model = saved.anthropic.model;
+				providerCache.anthropic.anthropicVersion = saved.anthropic.anthropicVersion;
 
 			systemPrompt = saved.common.systemPrompt;
 			maxTokens = saved.common.maxTokens;
@@ -1110,6 +1150,9 @@
 		model;
 		systemPrompt;
 		temperature;
+		topP;
+		presencePenalty;
+		frequencyPenalty;
 		maxTokens;
 		anthropicVersion;
 		showThinking;
@@ -1309,6 +1352,9 @@
 			model: model.trim(),
 			systemPrompt,
 			temperature: clamp(Number.isFinite(temperature) ? temperature : 0.7, 0, 2),
+			topP: clamp(Number.isFinite(topP) ? topP : 1, 0, 1),
+			presencePenalty: clamp(Number.isFinite(presencePenalty) ? presencePenalty : 0, -2, 2),
+			frequencyPenalty: clamp(Number.isFinite(frequencyPenalty) ? frequencyPenalty : 0, -2, 2),
 			maxTokens: Math.max(1, Math.floor(Number.isFinite(maxTokens) ? maxTokens : 1024)),
 			anthropicVersion: anthropicVersion.trim() || (DEFAULTS.anthropic.version ?? '2023-06-01')
 		};
@@ -1340,6 +1386,11 @@
 			debugSession = null;
 
 			while (true) {
+				const normalizedOpenAiTemperature = clamp(Number.isFinite(temperature) ? temperature : 0.7, 0, 2);
+				const normalizedOpenAiTopP = clamp(Number.isFinite(topP) ? topP : 1, 0, 1);
+				const normalizedOpenAiPresencePenalty = clamp(Number.isFinite(presencePenalty) ? presencePenalty : 0, -2, 2);
+				const normalizedOpenAiFrequencyPenalty = clamp(Number.isFinite(frequencyPenalty) ? frequencyPenalty : 0, -2, 2);
+
 				const request =
 					provider === 'openai'
 						? {
@@ -1348,7 +1399,10 @@
 									...(systemPrompt.trim() ? [{ role: 'system', content: systemPrompt.trim() }] : []),
 									...messages.map((m) => ({ role: m.role, content: m.content }))
 								],
-								temperature: Number.isFinite(temperature) ? temperature : 0.7,
+								temperature: normalizedOpenAiTemperature,
+								top_p: normalizedOpenAiTopP !== 1 ? normalizedOpenAiTopP : undefined,
+								presence_penalty: normalizedOpenAiPresencePenalty !== 0 ? normalizedOpenAiPresencePenalty : undefined,
+								frequency_penalty: normalizedOpenAiFrequencyPenalty !== 0 ? normalizedOpenAiFrequencyPenalty : undefined,
 								max_tokens: Number.isFinite(maxTokens) ? maxTokens : 1024,
 								stream_options: includeUsage && !didRetryWithoutUsage ? { include_usage: true } : undefined,
 								stream: true
@@ -1932,6 +1986,54 @@
 							max="2"
 							step="0.1"
 							bind:value={temperature}
+							disabled={streaming || provider !== 'openai'}
+						/>
+					</div>
+
+					<div class="field">
+						<div class="label-row">
+							<label for="topP">top_p（核采样）</label>
+							<span class="val">{topP}</span>
+						</div>
+						<input
+							id="topP"
+							type="range"
+							min="0"
+							max="1"
+							step="0.01"
+							bind:value={topP}
+							disabled={streaming || provider !== 'openai'}
+						/>
+					</div>
+
+					<div class="field">
+						<div class="label-row">
+							<label for="presencePenalty">presence_penalty（存在惩罚）</label>
+							<span class="val">{presencePenalty}</span>
+						</div>
+						<input
+							id="presencePenalty"
+							type="range"
+							min="-2"
+							max="2"
+							step="0.1"
+							bind:value={presencePenalty}
+							disabled={streaming || provider !== 'openai'}
+						/>
+					</div>
+
+					<div class="field">
+						<div class="label-row">
+							<label for="frequencyPenalty">frequency_penalty（频率惩罚）</label>
+							<span class="val">{frequencyPenalty}</span>
+						</div>
+						<input
+							id="frequencyPenalty"
+							type="range"
+							min="-2"
+							max="2"
+							step="0.1"
+							bind:value={frequencyPenalty}
 							disabled={streaming || provider !== 'openai'}
 						/>
 					</div>

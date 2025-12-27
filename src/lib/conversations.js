@@ -37,6 +37,9 @@
  *   model: string;
  *   systemPrompt: string;
  *   temperature: number;
+ *   topP: number;
+ *   presencePenalty: number;
+ *   frequencyPenalty: number;
  *   maxTokens: number;
  *   anthropicVersion: string;
  * }} ConversationRunSnapshot
@@ -221,11 +224,14 @@ function normalizeRunSnapshot(raw) {
 	const model = normalizeWhitespace(safeString(r.model, ''));
 	const systemPrompt = safeString(r.systemPrompt, '');
 	const temperature = clamp(safeNumber(r.temperature, 0.7), 0, 2);
+	const topP = clamp(safeNumber(r.topP ?? r.top_p, 1), 0, 1);
+	const presencePenalty = clamp(safeNumber(r.presencePenalty ?? r.presence_penalty, 0), -2, 2);
+	const frequencyPenalty = clamp(safeNumber(r.frequencyPenalty ?? r.frequency_penalty, 0), -2, 2);
 	const maxTokens = Math.max(1, Math.floor(safeNumber(r.maxTokens, 1024)));
 	const anthropicVersion = normalizeWhitespace(safeString(r.anthropicVersion, '2023-06-01')) || '2023-06-01';
 
 	// baseUrl/model 允许为空（例如仅导出历史，不保证可复现）；但仍保留字段便于 UI 展示
-	return { provider, baseUrl, model, systemPrompt, temperature, maxTokens, anthropicVersion };
+	return { provider, baseUrl, model, systemPrompt, temperature, topP, presencePenalty, frequencyPenalty, maxTokens, anthropicVersion };
 }
 
 /**
