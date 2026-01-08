@@ -52,6 +52,7 @@
 		parseAnthropicSseEvent,
 		parseOpenAiSseData
 	} from '$lib/thought-chain';
+	import { estimateUsdCost, formatUsd } from '$lib/cost.js';
 
 	type Provider = 'openai' | 'anthropic';
 	type Role = 'user' | 'assistant';
@@ -82,6 +83,37 @@
 		frequencyPenalty: number;
 		maxTokens: number;
 		anthropicVersion: string;
+	};
+
+	type CompareTargetSecret = {
+		apiKey: string;
+		inputUsdPer1M: number;
+		outputUsdPer1M: number;
+	};
+
+	type CompareTargetPricing = {
+		inputUsdPer1M: number;
+		outputUsdPer1M: number;
+	};
+
+	type CompareRunStatus = 'idle' | 'running' | 'done' | 'error' | 'aborted';
+
+	type CompareRun = {
+		id: string;
+		name: string;
+		provider: Provider;
+		baseUrl: string;
+		model: string;
+		run: ConversationRunSnapshot;
+		status: CompareRunStatus;
+		startedAt: number;
+		firstEventAt: number | null;
+		endedAt: number | null;
+		error: string | null;
+		content: string;
+		thinking: string;
+		usage: TokenUsage | null;
+		didRetryWithoutUsage: boolean;
 	};
 
 	type ConversationListItem = {
@@ -169,6 +201,10 @@
 			showThinking: boolean;
 			thinkingAutoExpand: boolean;
 			includeUsage: boolean;
+			compareMode: boolean;
+			compareTargetIds: string[];
+			compareEstimateCost: boolean;
+			comparePricingById: Record<string, CompareTargetPricing>;
 		};
 	};
 
@@ -231,6 +267,9 @@
 
 	const DESKTOP_BREAKPOINT_PX = 980;
 
+	const COMPARE_CURRENT_TARGET_ID = '__current';
+	const COMPARE_MAX_TARGETS = 6;
+
 	const LEFT_SIDEBAR_MIN_PX = 240;
 	const LEFT_SIDEBAR_MAX_PX = 520;
 	const RIGHT_SIDEBAR_MIN_PX = 280;
@@ -251,6 +290,46 @@
 	function safeNumber(v: unknown, fallback: number) {
 		const n = typeof v === 'number' ? v : Number(v);
 		return Number.isFinite(n) ? n : fallback;
+	}
+
+	function safeStringArray(v: unknown): string[] {
+		if (!Array.isArray(v)) return [];
+		const out: string[] = [];
+		for (const it of v) {
+			if (typeof it !== 'string') continue;
+			const s = it.trim();
+			if (!s) continue;
+			if (!out.includes(s)) out.push(s);
+		}
+		return out;
+	}
+
+	function normalizeCompareTargetIds(raw: string[]): string[] {
+		const out: string[] = [];
+		for (const it of raw) {
+			const s = typeof it === 'string' ? it.trim() : '';
+			if (!s) continue;
+			if (out.includes(s)) continue;
+			out.push(s);
+			if (out.length >= COMPARE_MAX_TARGETS) break;
+		}
+		return out.length ? out : [COMPARE_CURRENT_TARGET_ID];
+	}
+
+	function safeComparePricingById(v: unknown): Record<string, CompareTargetPricing> {
+		if (!v || typeof v !== 'object') return {};
+		const out: Record<string, CompareTargetPricing> = {};
+		for (const [rawId, rawPricing] of Object.entries(v)) {
+			const id = typeof rawId === 'string' ? rawId.trim() : '';
+			if (!id) continue;
+
+			const p = rawPricing as any;
+			const inputUsdPer1M = Math.max(0, safeNumber(p?.inputUsdPer1M, 0));
+			const outputUsdPer1M = Math.max(0, safeNumber(p?.outputUsdPer1M, 0));
+			if (inputUsdPer1M <= 0 && outputUsdPer1M <= 0) continue;
+			out[id] = { inputUsdPer1M, outputUsdPer1M };
+		}
+		return out;
 	}
 
 	function clamp(n: number, min: number, max: number) {
@@ -293,7 +372,11 @@
 					maxTokens: Math.max(1, Math.floor(safeNumber(common.maxTokens, 1024))),
 					showThinking: safeBoolean(common.showThinking, false),
 					thinkingAutoExpand: safeBoolean(common.thinkingAutoExpand, false),
-					includeUsage: safeBoolean(common.includeUsage, true)
+					includeUsage: safeBoolean(common.includeUsage, true),
+					compareMode: safeBoolean(common.compareMode, false),
+					compareTargetIds: normalizeCompareTargetIds(safeStringArray(common.compareTargetIds)),
+					compareEstimateCost: safeBoolean(common.compareEstimateCost, false),
+					comparePricingById: safeComparePricingById(common.comparePricingById)
 				}
 			};
 		} catch {
@@ -425,6 +508,12 @@
 	let showThinking = $state(false);
 	let thinkingAutoExpand = $state(false);
 	let includeUsage = $state(true);
+	let compareMode = $state(false);
+	let compareTargetIds = $state<string[]>([COMPARE_CURRENT_TARGET_ID]);
+	let compareEstimateCost = $state(false);
+	let compareSecretsById = $state<Record<string, CompareTargetSecret>>({});
+	let compareRuns = $state<CompareRun[]>([]);
+	let compareAbortControllers: AbortController[] = [];
 	let thinkingVisibleById = $state<Record<string, boolean>>({});
 	let thinkingOpenById = $state<Record<string, boolean>>({});
 	let streamingThinkingVisible = $state(false);
@@ -586,6 +675,7 @@
 		assistantThinkingDraft = '';
 		streamingThinkingVisible = false;
 		streamingThinkingOpen = false;
+		compareRuns = [];
 		thinkingVisibleById = {};
 		thinkingOpenById = {};
 		cancelEditMessage();
@@ -1177,7 +1267,7 @@
 		return `${base} (${Date.now()})`;
 	}
 
-	function snapshotCurrentProfileFields() {
+	function snapshotCurrentProfileFields(): ConversationRunSnapshot {
 		return {
 			provider,
 			baseUrl: safeString(baseUrl, '').trim(),
@@ -1801,6 +1891,15 @@
 			showThinking = saved.common.showThinking;
 			thinkingAutoExpand = saved.common.thinkingAutoExpand;
 			includeUsage = saved.common.includeUsage;
+			compareMode = saved.common.compareMode;
+			compareTargetIds = saved.common.compareTargetIds;
+			compareEstimateCost = saved.common.compareEstimateCost;
+			for (const [id, pricing] of Object.entries(saved.common.comparePricingById)) {
+				setCompareSecret(id, {
+					inputUsdPer1M: pricing.inputUsdPer1M,
+					outputUsdPer1M: pricing.outputUsdPer1M
+				});
+			}
 
 			provider = saved.provider;
 			lastProvider = provider;
@@ -1941,7 +2040,7 @@
 	$effect(() => {
 		if (!settingsHydrated) return;
 
-		// 依赖：仅保存“非敏感设置”，API Key 明确不落盘
+		// 依赖：仅保存“非敏感设置”，API Key 明确不落盘（compareSecretsById 仅用于提取价格）
 		provider;
 		baseUrl;
 		model;
@@ -1955,6 +2054,10 @@
 		showThinking;
 		thinkingAutoExpand;
 		includeUsage;
+		compareMode;
+		compareTargetIds;
+		compareEstimateCost;
+		compareSecretsById;
 
 		if (saveTimer) window.clearTimeout(saveTimer);
 		saveTimer = window.setTimeout(() => {
@@ -1969,7 +2072,11 @@
 					maxTokens: Math.max(1, Math.floor(Number.isFinite(maxTokens) ? maxTokens : 1024)),
 					showThinking,
 					thinkingAutoExpand,
-					includeUsage
+					includeUsage,
+					compareMode,
+					compareTargetIds: normalizeCompareTargetIds(compareTargetIds),
+					compareEstimateCost,
+					comparePricingById: snapshotComparePricingById()
 				}
 			});
 		}, 250);
@@ -2068,6 +2175,7 @@
 
 	function stop() {
 		abortController?.abort();
+		for (const c of compareAbortControllers) c?.abort();
 	}
 
 	function clearChat() {
@@ -2076,6 +2184,7 @@
 		assistantDraft = '';
 		assistantThinkingDraft = '';
 		streamingUsage = null;
+		compareRuns = [];
 		thinkingVisibleById = {};
 		thinkingOpenById = {};
 		streamingThinkingVisible = false;
@@ -2152,6 +2261,404 @@
 		return true;
 	}
 
+	function snapshotRunFromProfile(p: Profile): ConversationRunSnapshot {
+		return {
+			provider: p.provider,
+			baseUrl: safeString(p.baseUrl, '').trim(),
+			model: safeString(p.model, '').trim(),
+			systemPrompt: safeString(p.systemPrompt, ''),
+			temperature: clamp(Number.isFinite(p.temperature) ? p.temperature : 0.7, 0, 2),
+			topP: clamp(Number.isFinite(p.topP) ? p.topP : 1, 0, 1),
+			presencePenalty: clamp(Number.isFinite(p.presencePenalty) ? p.presencePenalty : 0, -2, 2),
+			frequencyPenalty: clamp(Number.isFinite(p.frequencyPenalty) ? p.frequencyPenalty : 0, -2, 2),
+			maxTokens: Math.max(1, Math.floor(Number.isFinite(p.maxTokens) ? p.maxTokens : 1024)),
+			anthropicVersion: safeString(p.anthropicVersion, DEFAULTS.anthropic.version ?? '2023-06-01').trim() || '2023-06-01'
+		};
+	}
+
+	function ensureCompareSecret(id: string): CompareTargetSecret {
+		const v = compareSecretsById[id];
+		return {
+			apiKey: typeof v?.apiKey === 'string' ? v.apiKey : '',
+			inputUsdPer1M: Number.isFinite(v?.inputUsdPer1M) ? v.inputUsdPer1M : 0,
+			outputUsdPer1M: Number.isFinite(v?.outputUsdPer1M) ? v.outputUsdPer1M : 0
+		};
+	}
+
+	function setCompareSecret(id: string, patch: Partial<CompareTargetSecret>) {
+		const prev = ensureCompareSecret(id);
+		compareSecretsById = { ...compareSecretsById, [id]: { ...prev, ...patch } };
+	}
+
+	function snapshotComparePricingById(): Record<string, CompareTargetPricing> {
+		const out: Record<string, CompareTargetPricing> = {};
+		for (const [id, v] of Object.entries(compareSecretsById)) {
+			const inputUsdPer1M = Number.isFinite(v?.inputUsdPer1M) ? Math.max(0, v.inputUsdPer1M) : 0;
+			const outputUsdPer1M = Number.isFinite(v?.outputUsdPer1M) ? Math.max(0, v.outputUsdPer1M) : 0;
+			if (inputUsdPer1M <= 0 && outputUsdPer1M <= 0) continue;
+			out[id] = { inputUsdPer1M, outputUsdPer1M };
+		}
+		return out;
+	}
+
+	function buildUpstreamRequestForRun(
+		run: ConversationRunSnapshot,
+		chatMessages: ChatMessage[],
+		includeUsageFlag: boolean,
+		didRetryWithoutUsage: boolean
+	) {
+		const trimmedModel = safeString(run.model, '').trim();
+		const max_tokens = Math.max(1, Math.floor(Number.isFinite(run.maxTokens) ? run.maxTokens : 1024));
+
+		if (run.provider === 'openai') {
+			const normalizedOpenAiTemperature = clamp(Number.isFinite(run.temperature) ? run.temperature : 0.7, 0, 2);
+			const normalizedOpenAiTopP = clamp(Number.isFinite(run.topP) ? run.topP : 1, 0, 1);
+			const normalizedOpenAiPresencePenalty = clamp(Number.isFinite(run.presencePenalty) ? run.presencePenalty : 0, -2, 2);
+			const normalizedOpenAiFrequencyPenalty = clamp(
+				Number.isFinite(run.frequencyPenalty) ? run.frequencyPenalty : 0,
+				-2,
+				2
+			);
+
+			const sys = safeString(run.systemPrompt, '').trim();
+
+			return {
+				model: trimmedModel,
+				messages: [...(sys ? [{ role: 'system', content: sys }] : []), ...chatMessages.map((m) => ({ role: m.role, content: m.content }))],
+				temperature: normalizedOpenAiTemperature,
+				top_p: normalizedOpenAiTopP !== 1 ? normalizedOpenAiTopP : undefined,
+				presence_penalty: normalizedOpenAiPresencePenalty !== 0 ? normalizedOpenAiPresencePenalty : undefined,
+				frequency_penalty: normalizedOpenAiFrequencyPenalty !== 0 ? normalizedOpenAiFrequencyPenalty : undefined,
+				max_tokens,
+				stream_options: includeUsageFlag && !didRetryWithoutUsage ? { include_usage: true } : undefined,
+				stream: true
+			};
+		}
+
+		const sys = safeString(run.systemPrompt, '').trim();
+		return {
+			model: trimmedModel,
+			system: sys ? sys : undefined,
+			messages: chatMessages.map((m) => ({ role: m.role, content: [{ type: 'text', text: m.content }] })),
+			max_tokens,
+			stream: true
+		};
+	}
+
+	function buildCompareTargets() {
+		const ids = normalizeCompareTargetIds(compareTargetIds);
+		const targets: Array<{ id: string; name: string; run: ConversationRunSnapshot; apiKey: string }> = [];
+
+		for (const id of ids) {
+			if (id === COMPARE_CURRENT_TARGET_ID) {
+				const secret = ensureCompareSecret(id);
+				const key = (secret.apiKey || apiKey || '').trim();
+				targets.push({ id, name: '当前设置', run: snapshotCurrentProfileFields(), apiKey: key });
+				continue;
+			}
+
+			const p = profiles.find((it) => it.id === id);
+			if (!p) continue;
+			const secret = ensureCompareSecret(id);
+			const key = (secret.apiKey || '').trim();
+			targets.push({ id, name: p.name || '未命名 Profile', run: snapshotRunFromProfile(p), apiKey: key });
+		}
+
+		return targets;
+	}
+
+	function validateComparePrereqs() {
+		const targets = buildCompareTargets();
+		if (targets.length < 2) {
+			error = '对比模式至少需要选择 2 个目标（可包含“当前设置”与 Profiles）。';
+			openSettingsPanel();
+			return false;
+		}
+
+		for (const t of targets) {
+			if (!t.run.baseUrl.trim()) {
+				error = `对比目标「${t.name}」缺少 Base URL。`;
+				openSettingsPanel();
+				return false;
+			}
+			if (!t.apiKey.trim()) {
+				error = `对比目标「${t.name}」缺少 API Key（仅保存在内存，不会落盘）。`;
+				openSettingsPanel();
+				return false;
+			}
+			if (!t.run.model.trim()) {
+				error = `对比目标「${t.name}」缺少模型名（model）。`;
+				openSettingsPanel();
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	async function runCompare() {
+		notice = null;
+		error = null;
+		lastEvent = null;
+
+		if (streaming) return;
+		if (!validateComparePrereqs()) return;
+
+		// 对比模式：不写入 debugSession（避免与单模型请求混淆）
+		debugSession = null;
+
+		const targets = buildCompareTargets();
+
+		compareRuns = targets.map((t) => ({
+			id: t.id,
+			name: t.name,
+			provider: t.run.provider,
+			baseUrl: t.run.baseUrl,
+			model: t.run.model,
+			run: t.run,
+			status: 'idle',
+			startedAt: 0,
+			firstEventAt: null,
+			endedAt: null,
+			error: null,
+			content: '',
+			thinking: '',
+			usage: null,
+			didRetryWithoutUsage: false
+		}));
+
+		streaming = true;
+		compareAbortControllers = targets.map(() => new AbortController());
+
+		try {
+			await Promise.allSettled(
+				targets.map(async (t, idx) => {
+					const runState = compareRuns[idx];
+					if (!runState) return;
+
+					let didRetryWithoutUsage = false;
+
+					while (true) {
+						runState.status = 'running';
+						runState.startedAt = Date.now();
+						runState.firstEventAt = null;
+						runState.endedAt = null;
+						runState.error = null;
+						runState.content = '';
+						runState.thinking = '';
+						runState.usage = null;
+
+						const thoughtSplitterLocal = createThoughtChainSplitter();
+						thoughtSplitterLocal.reset();
+						const anthropicCtxLocal = createAnthropicSseContext();
+
+						const request = buildUpstreamRequestForRun(t.run, messages, includeUsage, didRetryWithoutUsage);
+						const proxyPayloadBase = {
+							provider: t.run.provider,
+							baseUrl: t.run.baseUrl,
+							anthropicVersion: t.run.provider === 'anthropic' ? t.run.anthropicVersion.trim() : undefined,
+							request
+						};
+						const proxyPayload = { ...proxyPayloadBase, apiKey: t.apiKey };
+
+						let retryWithoutUsage = false;
+						let hadUpstreamError = false;
+
+						try {
+							const res = await fetch('/api/chat', {
+								method: 'POST',
+								headers: { 'content-type': 'application/json' },
+								body: JSON.stringify(proxyPayload),
+								signal: compareAbortControllers[idx]?.signal
+							});
+
+							if (!res.ok) {
+								const text = await res.text().catch(() => '');
+								runState.error = `代理请求失败（HTTP ${res.status}）${text ? `：${text}` : ''}`;
+								runState.status = 'error';
+								runState.endedAt = Date.now();
+								return;
+							}
+
+							await streamSse(
+								res,
+								(event) => {
+									if (!runState.firstEventAt) runState.firstEventAt = Date.now();
+
+									const proxyErr = parseProxyErrorEvent(event);
+									if (proxyErr) {
+										if (
+											t.run.provider === 'openai' &&
+											includeUsage &&
+											!didRetryWithoutUsage &&
+											proxyErr.status === 400 &&
+											looksLikeUsageUnsupportedError(proxyErr)
+										) {
+											retryWithoutUsage = true;
+											return false;
+										}
+
+										runState.error = proxyErr.status
+											? `上游错误（HTTP ${proxyErr.status}）：${proxyErr.message}`
+											: proxyErr.message;
+										runState.status = 'error';
+										hadUpstreamError = true;
+										return false;
+									}
+
+									if (t.run.provider === 'openai') {
+										const { done, contentDelta, thinkingDelta, usage } = parseOpenAiSseData(event.data);
+										if (usage) runState.usage = mergeTokenUsage(runState.usage, usage);
+										if (done) return false;
+
+										if (typeof thinkingDelta === 'string' && thinkingDelta) runState.thinking += thinkingDelta;
+
+										if (typeof contentDelta === 'string' && contentDelta) {
+											const out = thoughtSplitterLocal.push(contentDelta);
+											if (out.contentDelta) runState.content += out.contentDelta;
+											if (out.thinkingDelta) runState.thinking += out.thinkingDelta;
+										}
+
+										return true;
+									}
+
+									const { contentDelta, thinkingDelta, usage } = parseAnthropicSseEvent(event, anthropicCtxLocal);
+									if (usage) runState.usage = mergeTokenUsage(runState.usage, usage);
+									if (typeof thinkingDelta === 'string' && thinkingDelta) runState.thinking += thinkingDelta;
+									if (typeof contentDelta === 'string' && contentDelta) {
+										const out = thoughtSplitterLocal.push(contentDelta);
+										if (out.contentDelta) runState.content += out.contentDelta;
+										if (out.thinkingDelta) runState.thinking += out.thinkingDelta;
+									}
+									return true;
+								},
+								{ signal: compareAbortControllers[idx]?.signal }
+							);
+						} catch (e) {
+							if (compareAbortControllers[idx]?.signal.aborted) {
+								runState.status = 'aborted';
+								runState.error = null;
+							} else {
+								runState.status = 'error';
+								runState.error = e instanceof Error ? e.message : String(e);
+							}
+							runState.endedAt = Date.now();
+							return;
+						} finally {
+							// flush 残留 tag 切分
+							try {
+								const flushed = thoughtSplitterLocal.flush();
+								if (flushed.contentDelta) runState.content += flushed.contentDelta;
+								if (flushed.thinkingDelta) runState.thinking += flushed.thinkingDelta;
+							} catch {
+								// ignore
+							}
+						}
+
+						if (retryWithoutUsage) {
+							didRetryWithoutUsage = true;
+							runState.didRetryWithoutUsage = true;
+							continue;
+						}
+
+						if (compareAbortControllers[idx]?.signal.aborted) {
+							runState.status = 'aborted';
+							runState.endedAt = Date.now();
+							return;
+						}
+
+						runState.status = hadUpstreamError ? 'error' : 'done';
+						runState.endedAt = Date.now();
+						break;
+					}
+				})
+			);
+	} finally {
+			streaming = false;
+			abortController = null;
+			compareAbortControllers = [];
+		}
+	}
+
+	function isCompareTargetSelected(id: string) {
+		return normalizeCompareTargetIds(compareTargetIds).includes(id);
+	}
+
+	function toggleCompareTarget(id: string, checked: boolean) {
+		const current = normalizeCompareTargetIds(compareTargetIds);
+		if (checked) {
+			if (current.includes(id)) return;
+			if (current.length >= COMPARE_MAX_TARGETS) {
+				showNotice(`最多只能选择 ${COMPARE_MAX_TARGETS} 个对比目标`);
+				return;
+			}
+			compareTargetIds = normalizeCompareTargetIds([...current, id]);
+			return;
+		}
+
+		compareTargetIds = normalizeCompareTargetIds(current.filter((it) => it !== id));
+	}
+
+	function clearCompareResults() {
+		compareRuns = [];
+	}
+
+	async function copyCompareRun(id: string) {
+		const run = compareRuns.find((r) => r.id === id);
+		if (!run) return;
+		const text = safeString(run.content, '').trim();
+		if (!text) {
+			showNotice('该列正文为空，无法复制');
+			return;
+		}
+		await copyToClipboard(text);
+		showNotice('已复制');
+	}
+
+	function adoptCompareRun(id: string) {
+		if (streaming) return;
+		const run = compareRuns.find((r) => r.id === id);
+		if (!run) return;
+
+		const content = safeString(run.content, '').trim();
+		const thinking = safeString(run.thinking, '').trim();
+		if (!content && !thinking) {
+			showNotice('该列无可采用内容');
+			return;
+		}
+
+		currentConversationRun = run.run;
+		push('assistant', content, thinking || undefined, run.usage ?? undefined);
+		showNotice(`已采用「${run.name}」的回复`);
+		stickToBottom = true;
+		void scrollMessagesToBottom();
+	}
+
+	function fmtCompareStatus(status: CompareRunStatus) {
+		if (status === 'running') return '进行中';
+		if (status === 'done') return '完成';
+		if (status === 'aborted') return '已停止';
+		if (status === 'error') return '错误';
+		return '待命';
+	}
+
+	function getCompareTtfbMs(run: CompareRun): number | null {
+		if (!Number.isFinite(run.startedAt) || !run.startedAt) return null;
+		if (!Number.isFinite(run.firstEventAt ?? NaN) || !run.firstEventAt) return null;
+		return Math.max(0, run.firstEventAt - run.startedAt);
+	}
+
+	function getCompareDurationMs(run: CompareRun): number | null {
+		if (!Number.isFinite(run.startedAt) || !run.startedAt) return null;
+		if (!Number.isFinite(run.endedAt ?? NaN) || !run.endedAt) return null;
+		return Math.max(0, run.endedAt - run.startedAt);
+	}
+
+	function getCompareCostUsd(run: CompareRun): number | null {
+		if (!compareEstimateCost) return null;
+		return estimateUsdCost(run.usage, ensureCompareSecret(run.id));
+	}
+
 	async function runAssistant() {
 		notice = null;
 		error = null;
@@ -2199,34 +2706,12 @@
 			debugSession = null;
 
 			while (true) {
-				const normalizedOpenAiTemperature = clamp(Number.isFinite(temperature) ? temperature : 0.7, 0, 2);
-				const normalizedOpenAiTopP = clamp(Number.isFinite(topP) ? topP : 1, 0, 1);
-				const normalizedOpenAiPresencePenalty = clamp(Number.isFinite(presencePenalty) ? presencePenalty : 0, -2, 2);
-				const normalizedOpenAiFrequencyPenalty = clamp(Number.isFinite(frequencyPenalty) ? frequencyPenalty : 0, -2, 2);
-
-				const request =
-					provider === 'openai'
-						? {
-								model: trimmedModel,
-								messages: [
-									...(systemPrompt.trim() ? [{ role: 'system', content: systemPrompt.trim() }] : []),
-									...messages.map((m) => ({ role: m.role, content: m.content }))
-								],
-								temperature: normalizedOpenAiTemperature,
-								top_p: normalizedOpenAiTopP !== 1 ? normalizedOpenAiTopP : undefined,
-								presence_penalty: normalizedOpenAiPresencePenalty !== 0 ? normalizedOpenAiPresencePenalty : undefined,
-								frequency_penalty: normalizedOpenAiFrequencyPenalty !== 0 ? normalizedOpenAiFrequencyPenalty : undefined,
-								max_tokens: Number.isFinite(maxTokens) ? maxTokens : 1024,
-								stream_options: includeUsage && !didRetryWithoutUsage ? { include_usage: true } : undefined,
-								stream: true
-							}
-						: {
-								model: trimmedModel,
-								system: systemPrompt.trim() ? systemPrompt.trim() : undefined,
-								messages: messages.map((m) => ({ role: m.role, content: [{ type: 'text', text: m.content }] })),
-								max_tokens: Number.isFinite(maxTokens) ? maxTokens : 1024,
-								stream: true
-							};
+				const request = buildUpstreamRequestForRun(
+					currentConversationRun ?? snapshotCurrentProfileFields(),
+					messages,
+					includeUsage,
+					didRetryWithoutUsage
+				);
 
 				const proxyPayloadBase = {
 					provider,
@@ -2435,12 +2920,17 @@
 		if (streaming) return;
 		const text = prompt.trim();
 		if (!text) return;
-		if (!validateRunPrereqs()) return;
+		if (compareMode) {
+			if (!validateComparePrereqs()) return;
+		} else {
+			if (!validateRunPrereqs()) return;
+		}
 
 		stickToBottom = true;
 		push('user', text);
 		prompt = '';
-		await runAssistant();
+		if (compareMode) await runCompare();
+		else await runAssistant();
 	}
 </script>
 
@@ -2697,7 +3187,93 @@
 					</div>
 				{/each}
 
-				{#if streaming}
+				{#if compareMode && compareRuns.length}
+					<div class="compare-area">
+						<div class="compare-head">
+							<div class="compare-head-left">
+								<strong>对比结果</strong>
+								<span class="muted">{compareRuns.length} 个目标</span>
+							</div>
+							<div class="compare-head-actions">
+								<button class="btn btn-sm danger" type="button" onclick={stop} disabled={!streaming}>停止</button>
+								<button class="btn btn-sm" type="button" onclick={clearCompareResults} disabled={streaming}>清空</button>
+							</div>
+						</div>
+
+						<div class="compare-summary">
+							<div class="compare-summary-row compare-summary-header">
+								<span class="muted">目标</span>
+								<span class="muted">TTFB</span>
+								<span class="muted">总耗时</span>
+								<span class="muted">Tokens</span>
+								<span class="muted">Cost</span>
+							</div>
+							{#each compareRuns as r (r.id)}
+								<div class="compare-summary-row">
+									<div class="compare-summary-name">
+										<span class="mono">{r.name}</span>
+										<span class="muted mono">{r.model}</span>
+										<span class="pill">{r.provider === 'openai' ? 'OpenAI' : 'Anthropic'}</span>
+										<span class="pill">{fmtCompareStatus(r.status)}</span>
+									</div>
+									<span>{getCompareTtfbMs(r) == null ? '—' : fmtMs(getCompareTtfbMs(r)!)}</span>
+									<span>{getCompareDurationMs(r) == null ? (r.status === 'running' ? '进行中' : '—') : fmtMs(getCompareDurationMs(r)!)}</span>
+									<span class="muted">{formatTokenUsage(r.usage) ?? '—'}</span>
+									<span class:muted={!compareEstimateCost}>{formatUsd(getCompareCostUsd(r))}</span>
+								</div>
+							{/each}
+						</div>
+
+						<div class="compare-grid">
+							{#each compareRuns as r (r.id)}
+								<div class="compare-card">
+									<div class="compare-card-head">
+										<div class="compare-card-title">
+											<strong class="mono">{r.name}</strong>
+											<span class="muted mono">{r.model}</span>
+										</div>
+										<div class="compare-card-actions">
+											<button class="btn btn-sm" type="button" onclick={() => copyCompareRun(r.id)} disabled={!r.content.trim()}>
+												复制
+											</button>
+											<button
+												class="btn btn-sm"
+												type="button"
+												onclick={() => adoptCompareRun(r.id)}
+												disabled={streaming || (!r.content.trim() && !r.thinking.trim())}
+											>
+												采用
+											</button>
+										</div>
+									</div>
+
+									{#if r.error}
+										<div class="compare-run-error">{r.error}</div>
+									{/if}
+
+									{#if r.status === 'running'}
+										<pre>{r.content}</pre>
+									{:else}
+										{#if r.content.trim()}
+											<div class="md">{@html renderMarkdownToHtml(r.content)}</div>
+										{:else}
+											<div class="empty-content muted">（正文为空）</div>
+										{/if}
+									{/if}
+
+									{#if showThinking && r.thinking.trim()}
+										<details class="compare-thinking" open={thinkingAutoExpand}>
+											<summary>思维链</summary>
+											<pre>{r.thinking}</pre>
+										</details>
+									{/if}
+								</div>
+							{/each}
+						</div>
+					</div>
+				{/if}
+
+				{#if streaming && !compareMode}
 					<div class="msg assistant">
 						<div class="msg-content">
 							<div class="meta">
@@ -3033,6 +3609,121 @@
 							</label>
 						</div>
 					</div>
+
+				<div class="field-group">
+					<div class="field">
+						<label for="compareMode">对比模式</label>
+						<label class="checkbox">
+							<input id="compareMode" type="checkbox" bind:checked={compareMode} disabled={streaming} />
+							<span>同一输入并行跑多个目标（Profiles / 当前设置）</span>
+						</label>
+					</div>
+
+					{#if compareMode}
+						<div class="field">
+							<div class="label-row">
+								<span class="muted">对比目标</span>
+								<span class="muted">{normalizeCompareTargetIds(compareTargetIds).length}/{COMPARE_MAX_TARGETS}</span>
+							</div>
+
+							<div class="compare-targets">
+								<label class="checkbox compare-target">
+									<input
+										type="checkbox"
+										checked={isCompareTargetSelected(COMPARE_CURRENT_TARGET_ID)}
+										onchange={(e) =>
+											toggleCompareTarget(COMPARE_CURRENT_TARGET_ID, (e.currentTarget as HTMLInputElement).checked)}
+										disabled={streaming}
+									/>
+									<span>当前设置</span>
+								</label>
+
+								{#each profiles as p (p.id)}
+									<label class="checkbox compare-target">
+										<input
+											type="checkbox"
+											checked={isCompareTargetSelected(p.id)}
+											onchange={(e) => toggleCompareTarget(p.id, (e.currentTarget as HTMLInputElement).checked)}
+											disabled={streaming}
+										/>
+										<span class="compare-target-name">{p.name}</span>
+										<span class="muted mono">{p.provider === 'openai' ? 'OpenAI' : 'Anthropic'}</span>
+									</label>
+								{/each}
+							</div>
+
+							<div class="muted">提示：至少选择 2 个目标；API Key 不会落盘。</div>
+						</div>
+
+						<div class="field">
+							<label class="checkbox">
+								<input type="checkbox" bind:checked={compareEstimateCost} disabled={streaming} />
+								<span>估算成本（按输入/输出 $/1M tokens）</span>
+							</label>
+						</div>
+
+						<div class="compare-secrets">
+							{#each buildCompareTargets() as t (t.id)}
+								<details class="compare-secret">
+									<summary>
+										<span class="mono">{t.name}</span>
+										<span class="muted">{t.run.provider === 'openai' ? 'OpenAI' : 'Anthropic'}</span>
+									</summary>
+
+									<div class="field">
+										<label for={"compare-key-" + t.id}>API Key</label>
+										<input
+											id={"compare-key-" + t.id}
+											type="password"
+											value={ensureCompareSecret(t.id).apiKey}
+											placeholder={t.id === COMPARE_CURRENT_TARGET_ID ? '留空则使用上方 API Key' : 'sk-...'}
+											disabled={streaming}
+											autocapitalize="off"
+											autocomplete="off"
+											spellcheck="false"
+											oninput={(e) => setCompareSecret(t.id, { apiKey: (e.currentTarget as HTMLInputElement).value })}
+										/>
+									</div>
+
+									{#if compareEstimateCost}
+										<div class="compare-price-grid">
+											<div class="field">
+												<label for={"compare-in-" + t.id}>输入 $/1M</label>
+												<input
+													id={"compare-in-" + t.id}
+													type="number"
+													min="0"
+													step="0.01"
+													value={ensureCompareSecret(t.id).inputUsdPer1M}
+													disabled={streaming}
+													oninput={(e) =>
+														setCompareSecret(t.id, {
+															inputUsdPer1M: Number((e.currentTarget as HTMLInputElement).value)
+														})}
+												/>
+											</div>
+											<div class="field">
+												<label for={"compare-out-" + t.id}>输出 $/1M</label>
+												<input
+													id={"compare-out-" + t.id}
+													type="number"
+													min="0"
+													step="0.01"
+													value={ensureCompareSecret(t.id).outputUsdPer1M}
+													disabled={streaming}
+													oninput={(e) =>
+														setCompareSecret(t.id, {
+															outputUsdPer1M: Number((e.currentTarget as HTMLInputElement).value)
+														})}
+												/>
+											</div>
+										</div>
+									{/if}
+								</details>
+							{/each}
+						</div>
+					{/if}
+				</div>
 
 				<div class="field-group">
 					<div class="field">

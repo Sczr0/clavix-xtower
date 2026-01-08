@@ -241,6 +241,260 @@ input {
 	backdrop-filter: blur(8px);
 }
 
+/* Compare Mode */
+.compare-area {
+	border: 1px solid var(--border);
+	border-radius: 14px;
+	background: var(--panel);
+	box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+	padding: 12px 14px;
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+
+.compare-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.compare-head-left {
+	display: flex;
+	align-items: baseline;
+	gap: 10px;
+	min-width: 0;
+}
+
+.compare-head-actions {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-shrink: 0;
+}
+
+.compare-summary {
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	overflow: hidden;
+	background: var(--bg);
+}
+
+.compare-summary-row {
+	display: grid;
+	grid-template-columns: minmax(220px, 1.4fr) 90px 90px minmax(160px, 1fr) 80px;
+	gap: 10px;
+	align-items: center;
+	padding: 8px 10px;
+	font-size: 12px;
+}
+
+.compare-summary-row.compare-summary-header {
+	background: var(--panel-2);
+	font-weight: 700;
+}
+
+.compare-summary-row + .compare-summary-row {
+	border-top: 1px solid var(--border);
+}
+
+.compare-summary-name {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+	min-width: 0;
+}
+
+.compare-grid {
+	display: grid;
+	grid-auto-flow: column;
+	grid-auto-columns: minmax(360px, 1fr);
+	gap: 12px;
+	overflow-x: auto;
+	padding-bottom: 2px;
+	scrollbar-gutter: stable both-edges;
+}
+
+.compare-card {
+	min-width: 0;
+	display: grid;
+	gap: 8px;
+	padding: 12px 14px;
+	border: 1px solid var(--border);
+	border-radius: 14px;
+	background: var(--panel);
+	box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+.compare-card-head {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.compare-card-title {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+}
+
+.compare-card-title .mono {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.compare-card-actions {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-shrink: 0;
+}
+
+.compare-card > pre {
+	margin: 0;
+	white-space: pre-wrap;
+	word-break: break-word;
+	font-family: var(--font);
+	font-size: 15px;
+	line-height: 1.6;
+	color: var(--text);
+}
+
+.compare-run-error {
+	padding: 10px 12px;
+	border-radius: 12px;
+	background: rgba(217, 48, 37, 0.1);
+	border: 1px solid rgba(217, 48, 37, 0.18);
+	color: var(--danger);
+	font-size: 13px;
+}
+
+.compare-thinking {
+	margin-top: 6px;
+	padding-top: 8px;
+	border-top: 1px dashed var(--border);
+}
+
+.compare-thinking summary {
+	cursor: pointer;
+	user-select: none;
+	font-size: 12px;
+	color: var(--muted);
+	list-style: none;
+}
+
+.compare-thinking summary::-webkit-details-marker {
+	display: none;
+}
+
+.compare-thinking summary::before {
+	content: '▸';
+	display: inline-block;
+	margin-right: 6px;
+	color: var(--faint);
+	transition: transform 0.15s ease;
+}
+
+.compare-thinking[open] summary::before {
+	transform: rotate(90deg);
+}
+
+.compare-thinking pre {
+	margin-top: 8px;
+	padding: 10px 12px;
+	border-radius: 12px;
+	background: var(--panel-2);
+	font-size: 13px;
+	color: var(--muted);
+	white-space: pre-wrap;
+	word-break: break-word;
+	overflow-wrap: anywhere;
+	max-width: 100%;
+	overflow: auto;
+}
+
+/* Compare Mode (Settings Panel) */
+.compare-targets {
+	margin-top: 8px;
+	padding: 10px 12px;
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	background: var(--bg);
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	max-height: 220px;
+	overflow: auto;
+}
+
+.compare-target {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.compare-target-name {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.compare-secrets {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.compare-secret {
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	background: var(--bg);
+	padding: 8px 10px;
+}
+
+.compare-secret summary {
+	cursor: pointer;
+	user-select: none;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	font-size: 12px;
+	color: var(--muted);
+	list-style: none;
+}
+
+.compare-secret summary::-webkit-details-marker {
+	display: none;
+}
+
+.compare-price-grid {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 12px;
+}
+
+@media (max-width: 980px) {
+	.compare-grid {
+		grid-auto-columns: minmax(300px, 1fr);
+	}
+
+	.compare-summary-row {
+		grid-template-columns: minmax(220px, 1fr) 90px 90px minmax(140px, 1fr) 80px;
+	}
+
+	.compare-price-grid {
+		grid-template-columns: 1fr;
+	}
+}
+
 .muted {
 	color: var(--muted);
 }
