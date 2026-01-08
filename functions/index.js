@@ -1,5 +1,6 @@
 import { buildUpstreamUrl } from './lib/url.js';
 import { corsHeaders } from './lib/cors.js';
+import { checkFixedWindowRateLimit, getClientId } from './lib/rate-limit.js';
 
 function json(body, init = {}) {
 	const headers = new Headers(init.headers);
@@ -45,7 +46,95 @@ function normalizeAnthropicVersion(v) {
 	return s;
 }
 
-export async function handleRequest(request, { fetchFn = fetch } = {}) {
+function readEnvString(env, key) {
+	const fromEnv = env && typeof env === 'object' ? env[key] : undefined;
+	if (typeof fromEnv === 'string') return fromEnv;
+	if (fromEnv != null) return String(fromEnv);
+
+	// 本地 dev-proxy：回退到 process.env
+	if (typeof process !== 'undefined' && process?.env) {
+		const v = process.env[key];
+		return typeof v === 'string' ? v : '';
+	}
+
+	return '';
+}
+
+function readEnvInt(env, key, fallback) {
+	const raw = readEnvString(env, key).trim();
+	if (!raw) return fallback;
+	const n = Number(raw);
+	if (!Number.isFinite(n)) return fallback;
+	return Math.floor(n);
+}
+
+function normalizeAllowedHostPattern(raw) {
+	const p = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+	if (!p) return null;
+	if (p.includes('/') || p.includes(':')) return null;
+
+	const host = p.startsWith('*.') ? p.slice(2) : p.startsWith('.') ? p.slice(1) : p;
+	if (!host || !host.includes('.')) return null;
+	if (!/^[a-z0-9.-]+$/.test(host)) return null;
+
+	return p;
+}
+
+function parseAllowedHosts(raw) {
+	const s = typeof raw === 'string' ? raw.trim() : '';
+	if (!s) return [];
+
+	const out = [];
+	for (const part of s.split(',')) {
+		const p = normalizeAllowedHostPattern(part);
+		if (!p) continue;
+		if (!out.includes(p)) out.push(p);
+	}
+
+	// 若显式配置了白名单但解析结果为空：直接报错，避免“误以为已加白名单但其实放开”。
+	if (s && out.length === 0) throw new Error('上游域名白名单配置无效：EDGEAI_ALLOWED_UPSTREAM_HOSTS 为空或格式不正确');
+	return out;
+}
+
+function utf8ByteLength(text) {
+	const s = typeof text === 'string' ? text : String(text ?? '');
+	if (typeof Buffer !== 'undefined') return Buffer.byteLength(s, 'utf8');
+	return new TextEncoder().encode(s).length;
+}
+
+async function readJsonBody(request, maxBytes) {
+	const headers = corsHeaders(request);
+
+	const max = Math.max(0, Math.floor(maxBytes));
+	if (max > 0) {
+		const lenHeader = request.headers.get('content-length');
+		const n = lenHeader ? Number(lenHeader) : NaN;
+		if (Number.isFinite(n) && n > max) {
+			return { ok: false, response: json({ error: `请求体过大（>${max} bytes）` }, { status: 413, headers }) };
+		}
+	}
+
+	let text = '';
+	try {
+		text = await request.text();
+	} catch {
+		return { ok: false, response: json({ error: '请求体读取失败' }, { status: 400, headers }) };
+	}
+
+	if (max > 0) {
+		const bytes = utf8ByteLength(text);
+		if (bytes > max) return { ok: false, response: json({ error: `请求体过大（>${max} bytes）` }, { status: 413, headers }) };
+	}
+
+	try {
+		const parsed = JSON.parse(text);
+		return { ok: true, payload: parsed };
+	} catch {
+		return { ok: false, response: json({ error: '请求体必须是 JSON' }, { status: 400, headers }) };
+	}
+}
+
+export async function handleRequest(request, { fetchFn = fetch, env } = {}) {
 	const url = new URL(request.url);
 
 	if (url.pathname === '/api/health') return json({ ok: true, ts: Date.now() }, { headers: corsHeaders(request) });
@@ -57,20 +146,44 @@ export async function handleRequest(request, { fetchFn = fetch } = {}) {
 
 	if (url.pathname !== '/api/chat') return new Response('Not Found', { status: 404, headers: corsHeaders(request) });
 
-	let payload;
-	try {
-		payload = await request.json();
-	} catch {
-		return json({ error: '请求体必须是 JSON' }, { status: 400, headers: corsHeaders(request) });
+	// 可选：限流（默认关闭）
+	const rateLimitPerMinute = readEnvInt(env, 'EDGEAI_RATE_LIMIT_PER_MINUTE', 0);
+	if (rateLimitPerMinute > 0) {
+		const now = Date.now();
+		const key = getClientId(request);
+		const out = checkFixedWindowRateLimit({ key, limit: rateLimitPerMinute, windowMs: 60_000, now });
+		if (!out.allowed) {
+			const retryAfterSeconds = Math.max(1, Math.ceil((out.resetAt - now) / 1000));
+			const headers = corsHeaders(request);
+			headers.set('retry-after', String(retryAfterSeconds));
+			headers.set('x-rate-limit-limit', String(out.limit));
+			headers.set('x-rate-limit-remaining', String(out.remaining));
+			headers.set('x-rate-limit-reset', String(out.resetAt));
+
+			return json(
+				{ error: `请求过于频繁，请在 ${retryAfterSeconds}s 后重试。`, retryAfterSeconds },
+				{ status: 429, headers }
+			);
+		}
 	}
 
+	// 可选：请求体大小限制（默认关闭）
+	const maxRequestBytes = readEnvInt(env, 'EDGEAI_MAX_REQUEST_BYTES', 0);
+	const bodyRes = await readJsonBody(request, maxRequestBytes);
+	if (!bodyRes.ok) return bodyRes.response;
+
+	const payload = bodyRes.payload;
+
 	try {
+		const allowedHosts = parseAllowedHosts(readEnvString(env, 'EDGEAI_ALLOWED_UPSTREAM_HOSTS'));
+		const upstreamTimeoutMs = readEnvInt(env, 'EDGEAI_UPSTREAM_TIMEOUT_MS', 0);
+
 		const provider = sanitizeProvider(payload.provider);
 		const baseUrl = requireString(payload, 'baseUrl');
 		const apiKey = requireString(payload, 'apiKey');
 		const upstreamRequest = requireObject(payload, 'request');
 
-		const upstreamUrl = buildUpstreamUrl({ provider, baseUrl });
+		const upstreamUrl = buildUpstreamUrl({ provider, baseUrl, allowedHosts });
 		const upstreamHeaders = new Headers();
 
 		upstreamHeaders.set('content-type', 'application/json');
@@ -89,6 +202,8 @@ export async function handleRequest(request, { fetchFn = fetch } = {}) {
 				const encoder = new TextEncoder();
 				let closed = false;
 				let lastSentAt = Date.now();
+				let timeoutTimer = null;
+				let timedOut = false;
 
 				const keepAliveTimer = setInterval(() => {
 					if (closed) return;
@@ -107,6 +222,14 @@ export async function handleRequest(request, { fetchFn = fetch } = {}) {
 							typeof upstreamRequest === 'object' && upstreamRequest
 								? JSON.stringify({ ...upstreamRequest, stream: true })
 								: '{}';
+
+						const timeoutMs = Math.max(0, Math.floor(upstreamTimeoutMs));
+						if (timeoutMs > 0) {
+							timeoutTimer = setTimeout(() => {
+								timedOut = true;
+								aborter.abort();
+							}, timeoutMs);
+						}
 
 						const upstreamRes = await fetchFn(upstreamUrl.toString(), {
 							method: 'POST',
@@ -134,15 +257,21 @@ export async function handleRequest(request, { fetchFn = fetch } = {}) {
 							reader.releaseLock();
 						}
 					} catch (e) {
-						const msg = e instanceof Error ? e.message : String(e);
-						sseError(controller, msg);
+						const msg = timedOut
+							? `上游请求超时（${Math.max(0, Math.floor(upstreamTimeoutMs))}ms）`
+							: e instanceof Error
+								? e.message
+								: String(e);
+						sseError(controller, msg, timedOut ? 504 : undefined);
 					} finally {
 						closed = true;
+						if (timeoutTimer) clearTimeout(timeoutTimer);
 						clearInterval(keepAliveTimer);
 						controller.close();
 					}
 				})().catch(() => {
 					closed = true;
+					if (timeoutTimer) clearTimeout(timeoutTimer);
 					clearInterval(keepAliveTimer);
 					controller.close();
 				});
@@ -167,6 +296,6 @@ if (typeof addEventListener === 'function') {
 
 export default {
 	fetch(request, env, ctx) {
-		return handleRequest(request);
+		return handleRequest(request, { env });
 	}
 };

@@ -13,7 +13,43 @@ function isBlockedHostname(hostname) {
 	return false;
 }
 
-export function validateBaseUrl(baseUrl) {
+/**
+ * @param {string} hostname
+ * @param {string} pattern
+ */
+function matchHostPattern(hostname, pattern) {
+	const host = hostname.toLowerCase();
+	const p = typeof pattern === 'string' ? pattern.trim().toLowerCase() : '';
+	if (!p) return false;
+	if (p === host) return true;
+
+	// 支持：*.example.com / .example.com（后缀匹配，仅匹配子域名；根域名需显式加入 example.com）
+	if (p.startsWith('*.')) {
+		const suffix = p.slice(1); // ".example.com"
+		return suffix.length > 1 && host.endsWith(suffix);
+	}
+	if (p.startsWith('.')) return p.length > 1 && host.endsWith(p);
+
+	return false;
+}
+
+/**
+ * @param {string} hostname
+ * @param {string[]} allowedHosts
+ */
+function isHostnameAllowed(hostname, allowedHosts) {
+	if (!Array.isArray(allowedHosts) || allowedHosts.length === 0) return true;
+	for (const p of allowedHosts) {
+		if (matchHostPattern(hostname, p)) return true;
+	}
+	return false;
+}
+
+/**
+ * @param {string} baseUrl
+ * @param {{ allowedHosts?: string[] }} [options]
+ */
+export function validateBaseUrl(baseUrl, options = {}) {
 	if (typeof baseUrl !== 'string' || !baseUrl.trim()) throw new Error('baseUrl 不能为空');
 
 	let url;
@@ -38,11 +74,18 @@ export function validateBaseUrl(baseUrl) {
 	}
 	if (isBlockedHostname(hostname)) throw new Error('baseUrl 不允许指向本地/内网保留域名（例如 localhost/.local）');
 
+	const allowedHosts = options?.allowedHosts;
+	if (Array.isArray(allowedHosts) && allowedHosts.length) {
+		if (!isHostnameAllowed(hostname, allowedHosts)) {
+			throw new Error(`baseUrl 域名不在白名单：${hostname}`);
+		}
+	}
+
 	return url;
 }
 
-export function buildUpstreamUrl({ provider, baseUrl }) {
-	const base = validateBaseUrl(baseUrl);
+export function buildUpstreamUrl({ provider, baseUrl, allowedHosts }) {
+	const base = validateBaseUrl(baseUrl, { allowedHosts });
 	const basePath = base.pathname.replace(/\/+$/, '');
 	const apiPrefix = basePath.endsWith('/v1') ? basePath : `${basePath}/v1`;
 

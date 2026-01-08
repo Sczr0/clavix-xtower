@@ -18,6 +18,23 @@
 	} from '$lib/conversations';
 	import { buildProxyCurl, buildUpstreamCurl, buildUpstreamUrl, maskApiKey, prettyJson, truncateText } from '$lib/debug';
 	import {
+		buildDebugReportShareUrl,
+		createDebugReport,
+		decodeDebugReportFromHash,
+		toDebugReportJson,
+		toDebugReportMarkdown
+	} from '$lib/debug-report';
+	import {
+		buildProfilesShareUrl,
+		createProfileId,
+		decodeProfilesFromHash,
+		normalizeProfileName,
+		parseProfilesImport,
+		serializeProfilesExport,
+		readProfiles,
+		writeProfiles
+	} from '$lib/profiles';
+	import {
 		createAnthropicSseContext,
 		createThoughtChainSplitter,
 		parseAnthropicSseEvent,
@@ -150,6 +167,30 @@
 		v: 1;
 		leftSidebarWidth: number;
 		rightSidebarWidth: number;
+	};
+
+	type Profile = {
+		id: string;
+		name: string;
+		provider: Provider;
+		baseUrl: string;
+		model: string;
+		systemPrompt: string;
+		temperature: number;
+		topP: number;
+		presencePenalty: number;
+		frequencyPenalty: number;
+		maxTokens: number;
+		anthropicVersion: string;
+		createdAt: number;
+		updatedAt: number;
+		apiKey?: string;
+	};
+
+	type StoredProfilesV1 = {
+		v: 1;
+		currentId: string | null;
+		items: Profile[];
 	};
 
 	const DESKTOP_BREAKPOINT_PX = 980;
@@ -375,6 +416,14 @@
 	let importInputEl: HTMLInputElement | null = null;
 	const conversationSearchCache = new Map<string, string>();
 	const CONVERSATION_SAVE_DEBOUNCE_MS = 250;
+
+	// Profiles 资产化（localStorage v1；默认不落盘 API Key）
+	let profilesHydrated = $state(false);
+	let profiles = $state<Profile[]>([]);
+	let activeProfileId = $state('');
+	let newProfileName = $state('');
+	let profilesImportText = $state('');
+	let profilesImportInputEl = $state<HTMLInputElement | null>(null);
 
 	function handleGlobalKeydown(e: KeyboardEvent) {
 		if (e.key !== 'Escape') return;
@@ -825,6 +874,299 @@
 		});
 	}
 
+	function sortProfilesList(items: Profile[]) {
+		return [...items].sort((a, b) => {
+			if (b.updatedAt !== a.updatedAt) return b.updatedAt - a.updatedAt;
+			if (b.createdAt !== a.createdAt) return b.createdAt - a.createdAt;
+			return a.name.localeCompare(b.name);
+		});
+	}
+
+	function getProfile(id: string): Profile | null {
+		return profiles.find((p) => p.id === id) ?? null;
+	}
+
+	function persistProfiles() {
+		if (!profilesHydrated) return;
+		try {
+			const payload: StoredProfilesV1 = {
+				v: 1,
+				currentId: activeProfileId || null,
+				items: profiles.map((p) => ({ ...p }))
+			};
+			writeProfiles(localStorage, payload as any);
+		} catch {
+			// localStorage 可能被禁用（隐私模式/策略）
+		}
+	}
+
+	function makeUniqueProfileName(raw: string, ignoreId: string | null = null) {
+		const base = normalizeProfileName(raw);
+		const existing = new Set(profiles.filter((p) => p.id !== ignoreId).map((p) => p.name));
+		if (!existing.has(base)) return base;
+		for (let i = 2; i < 1000; i++) {
+			const next = `${base} (${i})`;
+			if (!existing.has(next)) return next;
+		}
+		return `${base} (${Date.now()})`;
+	}
+
+	function snapshotCurrentProfileFields() {
+		return {
+			provider,
+			baseUrl: safeString(baseUrl, '').trim(),
+			model: safeString(model, '').trim(),
+			systemPrompt: safeString(systemPrompt, ''),
+			temperature: clamp(Number.isFinite(temperature) ? temperature : 0.7, 0, 2),
+			topP: clamp(Number.isFinite(topP) ? topP : 1, 0, 1),
+			presencePenalty: clamp(Number.isFinite(presencePenalty) ? presencePenalty : 0, -2, 2),
+			frequencyPenalty: clamp(Number.isFinite(frequencyPenalty) ? frequencyPenalty : 0, -2, 2),
+			maxTokens: Math.max(1, Math.floor(Number.isFinite(maxTokens) ? maxTokens : 1024)),
+			anthropicVersion: safeString(anthropicVersion, DEFAULTS.anthropic.version ?? '2023-06-01').trim() || '2023-06-01'
+		};
+	}
+
+	function createProfileFromCurrent() {
+		if (streaming) return;
+
+		const now = Date.now();
+		const hint = model.trim() ? `${provider}:${model.trim()}` : provider;
+		const name = makeUniqueProfileName(newProfileName.trim() || hint);
+
+		const profile: Profile = {
+			id: createProfileId(),
+			name,
+			...snapshotCurrentProfileFields(),
+			createdAt: now,
+			updatedAt: now
+		};
+
+		profiles = sortProfilesList([profile, ...profiles]);
+		activeProfileId = profile.id;
+		newProfileName = '';
+		persistProfiles();
+		showNotice(`已保存 Profile：「${profile.name}」`);
+	}
+
+	function renameProfile(id: string) {
+		const p = getProfile(id);
+		if (!p) return;
+		const raw = window.prompt('重命名 Profile', p.name);
+		if (raw == null) return;
+		const name = makeUniqueProfileName(raw, id);
+
+		const idx = profiles.findIndex((it) => it.id === id);
+		if (idx === -1) return;
+		profiles[idx] = { ...profiles[idx], name, updatedAt: Date.now(), apiKey: undefined };
+		profiles = sortProfilesList(profiles);
+		persistProfiles();
+		showNotice('已重命名 Profile');
+	}
+
+	function updateProfileFromCurrent(id: string) {
+		if (streaming) return;
+		const idx = profiles.findIndex((it) => it.id === id);
+		if (idx === -1) return;
+		const now = Date.now();
+		profiles[idx] = {
+			...profiles[idx],
+			...snapshotCurrentProfileFields(),
+			updatedAt: now,
+			apiKey: undefined
+		};
+		profiles = sortProfilesList(profiles);
+		persistProfiles();
+		showNotice('已用当前设置覆盖 Profile');
+	}
+
+	function deleteProfile(id: string) {
+		const p = getProfile(id);
+		if (!p) return;
+		const ok = window.confirm(`确定删除 Profile「${p.name}」吗？此操作不可恢复。`);
+		if (!ok) return;
+
+		profiles = profiles.filter((it) => it.id !== id);
+		if (activeProfileId === id) activeProfileId = profiles[0]?.id ?? '';
+		persistProfiles();
+		showNotice('已删除 Profile');
+	}
+
+	function applyProfile(id: string) {
+		if (streaming) return;
+		const p = getProfile(id);
+		if (!p) return;
+
+		// 公共字段
+		systemPrompt = p.systemPrompt ?? '';
+		maxTokens = Math.max(1, Math.floor(Number.isFinite(p.maxTokens) ? p.maxTokens : 1024));
+
+		// provider-specific：写入 cache，再由 applyCacheToFields/switchProvider 统一落到字段上
+		if (p.provider === 'openai') {
+			providerCache.openai.baseUrl = p.baseUrl || DEFAULTS.openai.baseUrl;
+			providerCache.openai.model = p.model || '';
+			providerCache.openai.temperature = clamp(Number.isFinite(p.temperature) ? p.temperature : 0.7, 0, 2);
+			providerCache.openai.topP = clamp(Number.isFinite(p.topP) ? p.topP : 1, 0, 1);
+			providerCache.openai.presencePenalty = clamp(
+				Number.isFinite(p.presencePenalty) ? p.presencePenalty : 0,
+				-2,
+				2
+			);
+			providerCache.openai.frequencyPenalty = clamp(
+				Number.isFinite(p.frequencyPenalty) ? p.frequencyPenalty : 0,
+				-2,
+				2
+			);
+		} else {
+			providerCache.anthropic.baseUrl = p.baseUrl || DEFAULTS.anthropic.baseUrl;
+			providerCache.anthropic.model = p.model || '';
+			providerCache.anthropic.anthropicVersion =
+				p.anthropicVersion || (DEFAULTS.anthropic.version ?? '2023-06-01');
+		}
+
+		// 导入的 Profile 可能带 apiKey：仅填充输入框，不持久化
+		if (typeof p.apiKey === 'string' && p.apiKey.trim()) apiKey = p.apiKey.trim();
+
+		if (provider !== p.provider) {
+			provider = p.provider;
+			switchProvider(provider);
+		} else {
+			applyCacheToFields(provider);
+		}
+
+		activeProfileId = p.id;
+		persistProfiles();
+		showNotice(`已应用 Profile：「${p.name}」`);
+	}
+
+	function exportProfileJson(id: string) {
+		const p = getProfile(id);
+		if (!p) return;
+		const date = new Date().toISOString().slice(0, 10);
+		const filename = `profile-${safeFilenamePart(p.name)}-${date}.json`;
+		downloadText(filename, serializeProfilesExport([p]), 'application/json; charset=utf-8');
+		showNotice('已下载 Profile JSON（默认脱敏）');
+	}
+
+	async function copyProfileJson(id: string) {
+		const p = getProfile(id);
+		if (!p) return;
+		await copyToClipboard(serializeProfilesExport([p]));
+		showNotice('已复制 Profile JSON（默认脱敏）');
+	}
+
+	function exportAllProfilesJson() {
+		if (!profiles.length) return;
+		const date = new Date().toISOString().slice(0, 10);
+		const filename = `profiles-${date}.json`;
+		downloadText(filename, serializeProfilesExport(profiles), 'application/json; charset=utf-8');
+		showNotice('已下载 Profiles JSON（默认脱敏）');
+	}
+
+	async function copyAllProfilesJson() {
+		if (!profiles.length) return;
+		await copyToClipboard(serializeProfilesExport(profiles));
+		showNotice('已复制 Profiles JSON（默认脱敏）');
+	}
+
+	async function copyAllProfilesShareLink() {
+		if (!profiles.length) return;
+		if (!confirmShareProfile()) return;
+
+		const baseUrl = typeof location !== 'undefined' ? `${location.origin}${location.pathname}` : '';
+		const out = buildProfilesShareUrl({ baseUrl, profiles });
+		if (!out.ok) {
+			showNotice(out.reason);
+			return;
+		}
+
+		await copyToClipboard(out.url);
+		showNotice('已复制分享链接（默认脱敏；如过长请改用导出 JSON）');
+	}
+
+	function confirmShareProfile() {
+		return window.confirm(
+			`分享 Profile 将包含 baseUrl/model/system prompt/参数等信息（默认不包含明文 API Key）。\n\n请确认：\n- 只分享给可信对象\n- 不要发到公开渠道\n\n继续吗？`
+		);
+	}
+
+	async function copyProfileShareLink(id: string) {
+		const p = getProfile(id);
+		if (!p) return;
+		if (!confirmShareProfile()) return;
+
+		const baseUrl = typeof location !== 'undefined' ? `${location.origin}${location.pathname}` : '';
+		const out = buildProfilesShareUrl({ baseUrl, profiles: [p] });
+		if (!out.ok) {
+			showNotice(out.reason);
+			return;
+		}
+
+		await copyToClipboard(out.url);
+		showNotice('已复制分享链接（默认脱敏；如过长请改用导出 JSON）');
+	}
+
+	function addImportedProfiles(items: Profile[]) {
+		if (!items.length) return;
+
+		const existing = new Set(profiles.map((p) => p.name));
+		const now = Date.now();
+
+		const incoming: Profile[] = [];
+		for (const p of items) {
+			const base = normalizeProfileName(p.name);
+			let name = base;
+			if (existing.has(name)) {
+				for (let i = 2; i < 1000; i++) {
+					const next = `${base} (${i})`;
+					if (!existing.has(next)) {
+						name = next;
+						break;
+					}
+				}
+				if (existing.has(name)) name = `${base} (${now})`;
+			}
+			existing.add(name);
+			incoming.push({ ...p, name, updatedAt: now });
+		}
+
+		profiles = sortProfilesList([...incoming, ...profiles]);
+		activeProfileId = incoming[0].id;
+		persistProfiles();
+	}
+
+	async function handleProfilesImportFileChange() {
+		if (streaming) return;
+		const file = profilesImportInputEl?.files?.[0];
+		if (!file) return;
+
+		try {
+			const text = await file.text();
+			const res = parseProfilesImport(text, { keepApiKey: true });
+			if (!res.ok) {
+				error = `导入失败：${res.error}`;
+				return;
+			}
+
+			addImportedProfiles(res.profiles as any);
+			showNotice(`已导入 ${res.profiles.length} 个 Profile`);
+		} finally {
+			if (profilesImportInputEl) profilesImportInputEl.value = '';
+		}
+	}
+
+	function importProfilesFromText() {
+		if (streaming) return;
+		const res = parseProfilesImport(profilesImportText, { keepApiKey: true });
+		if (!res.ok) {
+			error = `导入失败：${res.error}`;
+			return;
+		}
+
+		addImportedProfiles(res.profiles as any);
+		profilesImportText = '';
+		showNotice(`已导入 ${res.profiles.length} 个 Profile`);
+	}
+
 	function clearDebugSession() {
 		debugSession = null;
 	}
@@ -838,6 +1180,50 @@
 		return window.confirm(
 			`${label} 将包含 API Key（明文）。\n\n请确认：\n- 只粘贴到可信环境\n- 不要截图/录屏/提交到仓库\n- 不要发到群聊或工单\n\n继续吗？`
 		);
+	}
+
+	function confirmShareDebugReport() {
+		return window.confirm(
+			`分享调试报告将包含你的提示词/模型输出/请求参数等信息（默认不包含明文 API Key）。\n\n请确认：\n- 只分享给可信对象\n- 不要把链接发到公开渠道\n\n继续吗？`
+		);
+	}
+
+	async function copyDebugReportJson() {
+		if (!debugSession) return;
+		const report = createDebugReport(debugSession, { mode: 'full' });
+		await copyToClipboard(toDebugReportJson(report));
+		showNotice('已复制调试报告 JSON（默认脱敏）。');
+	}
+
+	async function copyDebugReportMarkdown() {
+		if (!debugSession) return;
+		const report = createDebugReport(debugSession, { mode: 'full' });
+		await copyToClipboard(toDebugReportMarkdown(report));
+		showNotice('已复制调试报告 Markdown（默认脱敏）。');
+	}
+
+	function downloadDebugReportJson() {
+		if (!debugSession) return;
+		const date = new Date().toISOString().slice(0, 10);
+		const filename = `debug-report-${date}.json`;
+		const report = createDebugReport(debugSession, { mode: 'full' });
+		downloadText(filename, toDebugReportJson(report), 'application/json; charset=utf-8');
+		showNotice('已下载调试报告 JSON（默认脱敏）。');
+	}
+
+	async function copyDebugReportShareLink() {
+		if (!debugSession) return;
+		if (!confirmShareDebugReport()) return;
+
+		const baseUrl = typeof location !== 'undefined' ? `${location.origin}${location.pathname}` : '';
+		const out = buildDebugReportShareUrl({ baseUrl, session: debugSession });
+		if (!out.ok) {
+			showNotice(out.reason);
+			return;
+		}
+
+		await copyToClipboard(out.url);
+		showNotice('已复制分享链接（摘要版，部分字段可能截断）。');
 	}
 
 	async function copyDebugProxyJson(includeKey: boolean) {
@@ -1171,6 +1557,43 @@
 		conversationSearchCache.clear();
 		conversationsHydrated = true;
 		settingsHydrated = true;
+
+		// Profiles（localStorage v1）
+		try {
+			const saved = readProfiles(localStorage);
+			profiles = (saved?.items ?? []) as any;
+			activeProfileId = typeof saved?.currentId === 'string' ? saved.currentId : '';
+		} catch {
+			profiles = [];
+			activeProfileId = '';
+		}
+		profilesHydrated = true;
+
+		// 分享链接导入：#debug=...（默认导入为摘要版；导入成功后清理 hash，避免后续误分享/重复导入）
+		const imported = typeof location !== 'undefined' ? decodeDebugReportFromHash(location.hash) : null;
+		if (imported?.session) {
+			debugSession = imported.session as any;
+			openDebugPanel();
+			showNotice(imported.mode === 'share' ? '已从分享链接导入（摘要版）。' : '已从分享链接导入调试报告。');
+			try {
+				history.replaceState(null, '', `${location.pathname}${location.search}`);
+			} catch {
+				// 忽略：部分 WebView 可能不允许
+			}
+		}
+
+		// 分享链接导入：#profile=... / #profiles=...（默认脱敏；导入成功后清理 hash）
+		const importedProfiles = typeof location !== 'undefined' ? decodeProfilesFromHash(location.hash) : null;
+		if (importedProfiles?.profiles?.length) {
+			addImportedProfiles(importedProfiles.profiles as any);
+			openSettingsPanel();
+			showNotice(`已从分享链接导入 ${importedProfiles.profiles.length} 个 Profile（默认脱敏）`);
+			try {
+				history.replaceState(null, '', `${location.pathname}${location.search}`);
+			} catch {
+				// 忽略：部分 WebView 可能不允许
+			}
+		}
 
 		return () => window.removeEventListener('resize', handleResize);
 	});
@@ -1938,6 +2361,115 @@
 				{#if rightPanelTab === 'settings'}
 					<div class="panel-body">
 					<div class="field-group">
+						<div class="label-row">
+							<span class="muted">Profiles</span>
+							<span class="muted">{profiles.length ? `${profiles.length} 个` : '暂无'}</span>
+						</div>
+
+						{#if profiles.length === 0}
+							<div class="muted">暂无 Profile。可先配置右侧参数，然后点击下方“保存”创建。</div>
+						{:else}
+							<div class="profile-list">
+								{#each profiles as p (p.id)}
+									<div class="profile-item" class:active={p.id === activeProfileId}>
+										<button class="profile-select" type="button" onclick={() => applyProfile(p.id)} disabled={streaming}>
+											<div class="profile-title-row">
+												<span class="profile-title">{p.name}</span>
+												<span class="profile-time mono">{p.provider === 'openai' ? 'OpenAI' : 'Anthropic'}</span>
+											</div>
+											<div class="profile-meta">
+												{p.model || '（未设置模型）'}{p.baseUrl ? ` · ${p.baseUrl}` : ''}
+											</div>
+										</button>
+
+										{#if p.id === activeProfileId}
+											<div class="profile-actions-row">
+												<button class="btn btn-sm" type="button" onclick={() => updateProfileFromCurrent(p.id)} disabled={streaming}>
+													用当前覆盖
+												</button>
+												<button class="btn btn-sm" type="button" onclick={() => renameProfile(p.id)}>重命名</button>
+												<button class="btn btn-sm" type="button" onclick={() => exportProfileJson(p.id)}>导出</button>
+												<button class="btn btn-sm" type="button" onclick={() => copyProfileJson(p.id)}>复制 JSON</button>
+												<button class="btn btn-sm" type="button" onclick={() => copyProfileShareLink(p.id)}>分享链接</button>
+												<button class="btn btn-sm danger" type="button" onclick={() => deleteProfile(p.id)}>删除</button>
+											</div>
+										{/if}
+									</div>
+								{/each}
+							</div>
+						{/if}
+
+						<div class="field">
+							<label for="newProfileName">保存当前为新 Profile</label>
+							<div class="profile-create-row">
+								<input
+									id="newProfileName"
+									bind:value={newProfileName}
+									placeholder="例如：OpenAI:gpt-4o-mini"
+									disabled={streaming}
+									autocapitalize="off"
+									autocomplete="off"
+									spellcheck="false"
+								/>
+								<button class="btn" type="button" onclick={createProfileFromCurrent} disabled={streaming}>保存</button>
+							</div>
+						</div>
+
+						<div class="field">
+							<label for="profilesImportFile">导入 / 导出</label>
+							<div class="debug-actions">
+								<button class="btn btn-sm" type="button" onclick={exportAllProfilesJson} disabled={profiles.length === 0}>
+									导出全部
+								</button>
+								<button class="btn btn-sm" type="button" onclick={copyAllProfilesJson} disabled={profiles.length === 0}>
+									复制全部 JSON
+								</button>
+								<button class="btn btn-sm" type="button" onclick={copyAllProfilesShareLink} disabled={profiles.length === 0}>
+									分享全部
+								</button>
+								<button class="btn btn-sm" type="button" onclick={() => profilesImportInputEl?.click()} disabled={streaming}>
+									导入文件
+								</button>
+							</div>
+
+							<details class="profiles-details">
+								<summary>粘贴导入</summary>
+								<div class="field">
+									<textarea
+										bind:value={profilesImportText}
+										rows="6"
+										placeholder="粘贴 Profiles JSON（默认不含 API Key）"
+										disabled={streaming}
+									></textarea>
+								</div>
+								<div class="debug-actions">
+									<button
+										class="btn btn-sm"
+										type="button"
+										onclick={importProfilesFromText}
+										disabled={streaming || !profilesImportText.trim()}
+									>
+										导入
+									</button>
+									<button class="btn btn-sm" type="button" onclick={() => (profilesImportText = '')} disabled={!profilesImportText.trim()}>
+										清空
+									</button>
+								</div>
+							</details>
+
+							<input
+								id="profilesImportFile"
+								class="file-input"
+								type="file"
+								accept="application/json"
+								bind:this={profilesImportInputEl}
+								onchange={handleProfilesImportFileChange}
+							/>
+						</div>
+
+						<div class="muted">提示：导出/分享默认不包含明文 API Key；Profile 可能包含 system prompt 等敏感信息，请谨慎分享。</div>
+					</div>
+					<div class="field-group">
 						<div class="field">
 							<label for="provider">提供方</label>
 							<select
@@ -2130,6 +2662,10 @@
 								<div class="debug-section-head">
 									<strong>本次请求</strong>
 									<div class="debug-actions">
+										<button class="btn btn-sm" type="button" onclick={copyDebugReportJson}>报告 JSON</button>
+										<button class="btn btn-sm" type="button" onclick={copyDebugReportMarkdown}>报告 MD</button>
+										<button class="btn btn-sm" type="button" onclick={copyDebugReportShareLink}>分享链接</button>
+										<button class="btn btn-sm" type="button" onclick={downloadDebugReportJson}>下载 JSON</button>
 										<button class="btn btn-sm" type="button" onclick={clearDebugSession}>清空</button>
 									</div>
 								</div>
