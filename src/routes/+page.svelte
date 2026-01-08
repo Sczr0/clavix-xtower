@@ -2,6 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { streamSse, type SseEvent } from '$lib/sse';
 	import { renderMarkdownToHtml } from '$lib/markdown';
+	import { buildForkForRerun, buildForkForRetry } from '$lib/chat-ops.js';
 	import {
 		DEFAULT_CONVERSATION_TITLE,
 		ensureConversations,
@@ -382,6 +383,8 @@
 
 	let prompt = $state('');
 	let messages = $state<ChatMessage[]>([]);
+	let editingMessageId = $state<string | null>(null);
+	let editingMessageDraft = $state('');
 	let assistantDraft = $state('');
 	let assistantThinkingDraft = $state('');
 	let streamingUsage = $state<TokenUsage | null>(null);
@@ -585,6 +588,7 @@
 		streamingThinkingOpen = false;
 		thinkingVisibleById = {};
 		thinkingOpenById = {};
+		cancelEditMessage();
 		error = null;
 		lastEvent = null;
 		stickToBottom = true;
@@ -807,6 +811,50 @@
 		conversations = sortConversationList([nextMeta, ...conversations]);
 		persistConversationsIndex();
 		selectConversation(newId);
+	}
+
+	function forkConversationFromMessages(baseMessages: ChatMessage[], suffix: string) {
+		if (streaming) return null;
+		const now = Date.now();
+		const newId = createId();
+
+		const srcMeta = getCurrentConversationMeta();
+		const baseTitle = srcMeta ? srcMeta.title : DEFAULT_CONVERSATION_TITLE;
+
+		const meta: ConversationListItem = {
+			id: newId,
+			title: normalizeConversationTitle(`${baseTitle} · ${suffix}`),
+			createdAt: now,
+			updatedAt: now,
+			lastSnippet: '',
+			pinned: false
+		};
+
+		const forkMessages = baseMessages.map((m) => ({ ...m, ...(m.usage ? { usage: { ...m.usage } } : {}) }));
+		const nextMeta = updateConversationMetaFromMessages(meta, forkMessages, now);
+
+		try {
+			writeConversationDetail(localStorage, {
+				v: 1,
+				id: newId,
+				messages: forkMessages,
+				run: currentConversationRun
+			});
+		} catch {
+			// localStorage 可能被禁用（隐私模式/策略）
+		}
+
+		conversations = sortConversationList([nextMeta, ...conversations]);
+		currentConversationId = newId;
+		messages = forkMessages;
+		editingConversationId = null;
+		editingConversationTitle = '';
+
+		persistConversationsIndex();
+		resetTransientUiAfterConversationChange();
+		conversationsOpen = false;
+
+		return newId;
 	}
 
 	function deleteConversation(id: string) {
@@ -1505,7 +1553,9 @@
 
 	function handleMessagesClick(e: MouseEvent) {
 		const target = e.target as HTMLElement | null;
-		const btn = target?.closest?.('button[data-copy-code]') as HTMLButtonElement | null;
+		const copyBtn = target?.closest?.('button[data-copy-code]') as HTMLButtonElement | null;
+		const downloadBtn = target?.closest?.('button[data-download-code]') as HTMLButtonElement | null;
+		const btn = copyBtn || downloadBtn;
 		if (!btn) return;
 
 		const root = btn.closest?.('.md-code') as HTMLElement | null;
@@ -1513,22 +1563,65 @@
 		const text = codeEl?.textContent ?? '';
 		if (!text) return;
 
-		btn.disabled = true;
-		const oldText = btn.textContent ?? '复制';
+		if (downloadBtn) {
+			const lang = (root?.querySelector?.('.md-code-lang') as HTMLElement | null)?.textContent?.trim().toLowerCase() ?? '';
+			const ext =
+				lang === 'js' || lang === 'javascript'
+					? 'js'
+					: lang === 'ts' || lang === 'typescript'
+						? 'ts'
+						: lang === 'json'
+							? 'json'
+							: lang === 'md' || lang === 'markdown'
+								? 'md'
+								: lang === 'yaml'
+									? 'yaml'
+									: lang === 'yml'
+										? 'yml'
+										: lang === 'sql'
+											? 'sql'
+											: lang === 'bash' || lang === 'sh' || lang === 'shell'
+												? 'sh'
+												: lang === 'html'
+													? 'html'
+													: lang === 'xml'
+														? 'xml'
+														: lang === 'css'
+															? 'css'
+															: 'txt';
+
+			const stamp = new Date().toISOString().slice(0, 19).replace('T', '_').replaceAll(':', '-');
+			const filename = `code-${stamp}.${ext}`;
+
+			downloadBtn.disabled = true;
+			const oldText = downloadBtn.textContent ?? '下载';
+			downloadText(filename, text, 'text/plain; charset=utf-8');
+			downloadBtn.textContent = '已下载';
+			setTimeout(() => {
+				downloadBtn.textContent = oldText;
+				downloadBtn.disabled = false;
+			}, 1200);
+			return;
+		}
+
+		if (!copyBtn) return;
+
+		copyBtn.disabled = true;
+		const oldText = copyBtn.textContent ?? '复制';
 
 		void copyToClipboard(text)
 			.then(() => {
-				btn.textContent = '已复制';
+				copyBtn.textContent = '已复制';
 				setTimeout(() => {
-					btn.textContent = oldText;
-					btn.disabled = false;
+					copyBtn.textContent = oldText;
+					copyBtn.disabled = false;
 				}, 1200);
 			})
 			.catch(() => {
-				btn.textContent = '复制失败';
+				copyBtn.textContent = '复制失败';
 				setTimeout(() => {
-					btn.textContent = oldText;
-					btn.disabled = false;
+					copyBtn.textContent = oldText;
+					copyBtn.disabled = false;
 				}, 1200);
 			});
 	}
@@ -1954,6 +2047,19 @@
 		return parts.length ? `Tokens：${parts.join(' · ')}` : null;
 	}
 
+	function startEditMessage(id: string) {
+		if (streaming) return;
+		const m = messages.find((it) => it.id === id);
+		if (!m) return;
+		editingMessageId = id;
+		editingMessageDraft = m.content ?? '';
+	}
+
+	function cancelEditMessage() {
+		editingMessageId = null;
+		editingMessageDraft = '';
+	}
+
 	function push(role: Role, content: string, thinking?: string, usage?: TokenUsage) {
 		const id = typeof crypto?.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
 		messages.push({ id, role, content, thinking, usage, at: Date.now() });
@@ -1974,6 +2080,7 @@
 		thinkingOpenById = {};
 		streamingThinkingVisible = false;
 		streamingThinkingOpen = false;
+		cancelEditMessage();
 		notice = null;
 		if (noticeTimer) window.clearTimeout(noticeTimer);
 		noticeTimer = null;
@@ -2026,28 +2133,32 @@
 		return true;
 	}
 
-	async function send() {
+	function validateRunPrereqs() {
+		if (!baseUrl.trim()) {
+			error = '请填写上游 Base URL（必须是 https 域名，可选以 /v1 结尾；不允许 IP/端口/query）。';
+			openSettingsPanel();
+			return false;
+		}
+		if (!apiKey.trim()) {
+			error = '请填写 API Key（仅保存在浏览器内存，不会写入服务端存储）。';
+			openSettingsPanel();
+			return false;
+		}
+		if (!model.trim()) {
+			error = '请填写模型名。';
+			openSettingsPanel();
+			return false;
+		}
+		return true;
+	}
+
+	async function runAssistant() {
 		notice = null;
 		error = null;
 		lastEvent = null;
 
 		if (streaming) return;
-		if (!prompt.trim()) return;
-		if (!baseUrl.trim()) {
-			error = '请填写上游 Base URL（必须是 https 域名，可选以 /v1 结尾；不允许 IP/端口/query）。';
-			openSettingsPanel();
-			return;
-		}
-		if (!apiKey.trim()) {
-			error = '请填写 API Key（仅保存在浏览器内存，不会写入服务端存储）。';
-			openSettingsPanel();
-			return;
-		}
-		if (!model.trim()) {
-			error = '请填写模型名。';
-			openSettingsPanel();
-			return;
-		}
+		if (!validateRunPrereqs()) return;
 
 		// 保存本次“运行快照”（不保存 API Key），用于导出/复现
 		currentConversationRun = {
@@ -2064,8 +2175,6 @@
 		};
 
 		stickToBottom = true;
-		push('user', prompt.trim());
-		prompt = '';
 		assistantDraft = '';
 		assistantThinkingDraft = '';
 		streamingUsage = null;
@@ -2265,6 +2374,74 @@
 			streamingThinkingOpen = false;
 		}
 	}
+
+	function isLastAssistantMessage(id: string) {
+		if (!id) return false;
+		const idx = messages.findIndex((m) => m.id === id);
+		if (idx < 0) return false;
+		return idx === messages.length - 1 && messages[idx]?.role === 'assistant';
+	}
+
+	async function rerunFromMessage(messageId: string, editedContent?: string) {
+		if (streaming) return;
+		const out = buildForkForRerun(messages, messageId, editedContent);
+		if (!out.ok) {
+			showNotice(out.reason);
+			return;
+		}
+
+		forkConversationFromMessages(out.forkMessages, '重跑');
+		cancelEditMessage();
+
+		if (out.shouldAutoRun) {
+			await runAssistant();
+			return;
+		}
+
+		showNotice('已分叉到此处，可继续提问。');
+		await tick();
+		promptTextareaEl?.focus();
+	}
+
+	async function retryAssistantMessage(messageId: string) {
+		if (streaming) return;
+		const out = buildForkForRetry(messages, messageId);
+		if (!out.ok) {
+			showNotice(out.reason);
+			return;
+		}
+
+		forkConversationFromMessages(out.forkMessages, '重试');
+		cancelEditMessage();
+
+		if (out.shouldAutoRun) await runAssistant();
+	}
+
+	async function continueLastAssistant() {
+		if (streaming) return;
+		const last = messages[messages.length - 1];
+		if (!last || last.role !== 'assistant') return;
+		if (!validateRunPrereqs()) return;
+		stickToBottom = true;
+		push('user', '请继续');
+		await runAssistant();
+	}
+
+	async function send() {
+		notice = null;
+		error = null;
+		lastEvent = null;
+
+		if (streaming) return;
+		const text = prompt.trim();
+		if (!text) return;
+		if (!validateRunPrereqs()) return;
+
+		stickToBottom = true;
+		push('user', text);
+		prompt = '';
+		await runAssistant();
+	}
 </script>
 
 <svelte:window onkeydown={handleGlobalKeydown} />
@@ -2458,11 +2635,53 @@
 												: '思维链'}
 									</button>
 								{/if}
+
+								<span class="meta-spacer"></span>
+
+								{#if editingMessageId === m.id}
+									<button class="meta-pill" type="button" onclick={cancelEditMessage} disabled={streaming}>取消</button>
+									<button
+										class="meta-pill"
+										type="button"
+										onclick={() => rerunFromMessage(m.id, editingMessageDraft)}
+										disabled={streaming}
+									>
+										从此处重跑
+									</button>
+								{:else}
+									<button class="meta-pill" type="button" onclick={() => startEditMessage(m.id)} disabled={streaming}>编辑</button>
+
+									{#if m.role === 'user'}
+										<button class="meta-pill" type="button" onclick={() => rerunFromMessage(m.id)} disabled={streaming}>
+											从此处重跑
+										</button>
+									{:else}
+										<button class="meta-pill" type="button" onclick={() => retryAssistantMessage(m.id)} disabled={streaming}>重试</button>
+										{#if isLastAssistantMessage(m.id)}
+											<button class="meta-pill" type="button" onclick={continueLastAssistant} disabled={streaming}>续写</button>
+										{/if}
+									{/if}
+								{/if}
 							</div>
-							{#if m.content.trim()}
-								<div class="md">{@html renderMarkdownToHtml(m.content)}</div>
+
+							{#if editingMessageId === m.id}
+								<div class="msg-edit">
+									<textarea
+										bind:value={editingMessageDraft}
+										rows="6"
+										disabled={streaming}
+										autocapitalize="off"
+										autocomplete="off"
+										spellcheck="false"
+									></textarea>
+									<div class="muted msg-edit-hint">提示：编辑完成后点击上方“从此处重跑”会创建分叉会话。</div>
+								</div>
 							{:else}
-								<div class="empty-content muted">（正文为空）</div>
+								{#if m.content.trim()}
+									<div class="md">{@html renderMarkdownToHtml(m.content)}</div>
+								{:else}
+									<div class="empty-content muted">（正文为空）</div>
+								{/if}
 							{/if}
 							{#if m.role === 'assistant' && m.thinking?.trim() && (showThinking || thinkingVisibleById[m.id])}
 								<details
@@ -2500,6 +2719,9 @@
 												: '思维链'}
 									</button>
 								{/if}
+
+								<span class="meta-spacer"></span>
+								<button class="meta-pill" type="button" onclick={stop}>停止</button>
 							</div>
 							<pre>{assistantDraft}</pre>
 							{#if assistantThinkingDraft.trim() && (showThinking || streamingThinkingVisible)}

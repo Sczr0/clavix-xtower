@@ -94,7 +94,10 @@ marked.use({
 <div class="md-code">
   <div class="md-code-header">
     ${labelHtml}
-    <button type="button" class="md-code-copy" data-copy-code>复制</button>
+    <div class="md-code-actions">
+      <button type="button" class="md-code-btn md-code-copy" data-copy-code>复制</button>
+      <button type="button" class="md-code-btn md-code-download" data-download-code>下载</button>
+    </div>
   </div>
   <pre><code class="hljs${languageClass ? ` language-${languageClass}` : ''}">${html}</code></pre>
 </div>
@@ -116,7 +119,7 @@ export function renderMarkdownToHtml(markdownText: string): string {
 
 	return DOMPurify.sanitize(raw, {
 		USE_PROFILES: { html: true },
-		ADD_ATTR: ['target', 'rel', 'data-copy-code'],
+		ADD_ATTR: ['target', 'rel', 'data-copy-code', 'data-download-code'],
 		ADD_TAGS: ['button']
 	});
 }

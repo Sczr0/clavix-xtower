@@ -5,7 +5,8 @@
 ## 功能
 
 - OpenAI Compatible（`/v1/chat/completions`）与 Anthropic（`/v1/messages`）上游代理与流式回传（SSE）
-- Markdown 渲染：支持代码块高亮与一键复制
+- Markdown 渲染：支持代码块高亮、一键复制与下载
+- 消息级操作：编辑历史消息后“从此处重跑”（分叉会话）、一键重试、续写、停止
 - 思维链展示：若上游返回 `reasoning/thinking` 字段，或模型输出包含 `<think>/<analysis>` 标签，会与正文拆分并在 UI 中折叠展示（默认不显示；也可按单条消息展开）
 - 设置持久化：除 API Key 外，其余运行设置会写入浏览器 `localStorage`（刷新不丢）
 - OpenAI 采样参数：支持在设置面板配置 `top_p`、`presence_penalty`、`frequency_penalty`（默认不改变原行为）
