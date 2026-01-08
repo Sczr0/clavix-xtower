@@ -3,6 +3,35 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<script>
+			// 首屏抢先应用 UI 偏好（主题/字号/密度），避免 CSS 加载后再切换导致闪烁（FOUC）
+			(() => {
+				const KEY = 'edgeai-playground:ui-prefs:v1';
+				const root = document.documentElement;
+
+				try {
+					const raw = localStorage.getItem(KEY);
+					if (!raw) return;
+					const parsed = JSON.parse(raw);
+					if (!parsed || parsed.v !== 1) return;
+
+					const cs = parsed.colorScheme;
+					if (cs === 'dark' || cs === 'light') root.setAttribute('data-color-scheme', cs);
+					else root.removeAttribute('data-color-scheme');
+
+					const font = parsed.fontSize;
+					root.setAttribute('data-font', font === 'sm' || font === 'md' || font === 'lg' ? font : 'md');
+
+					const density = parsed.density;
+					root.setAttribute(
+						'data-density',
+						density === 'compact' || density === 'comfortable' || density === 'spacious' ? density : 'comfortable'
+					);
+				} catch {
+					// localStorage 可能被禁用（隐私模式/策略），或内容被污染：直接降级为默认即可
+				}
+			})();
+		</script>
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">

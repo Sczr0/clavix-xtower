@@ -53,6 +53,7 @@
 		parseOpenAiSseData
 	} from '$lib/thought-chain';
 	import { estimateUsdCost, formatUsd } from '$lib/cost.js';
+	import { applyUiPrefsToRoot, createDefaultUiPrefs, readUiPrefs, writeUiPrefs } from '$lib/ui-prefs.js';
 
 	type Provider = 'openai' | 'anthropic';
 	type Role = 'user' | 'assistant';
@@ -215,6 +216,17 @@
 		v: 1;
 		leftSidebarWidth: number;
 		rightSidebarWidth: number;
+	};
+
+	type UiColorScheme = 'system' | 'light' | 'dark';
+	type UiFontSize = 'sm' | 'md' | 'lg';
+	type UiDensity = 'compact' | 'comfortable' | 'spacious';
+
+	type StoredUiPrefsV1 = {
+		v: 1;
+		colorScheme: UiColorScheme;
+		fontSize: UiFontSize;
+		density: UiDensity;
 	};
 
 	type Profile = {
@@ -477,6 +489,13 @@
 	let error = $state<string | null>(null);
 
 	let settingsHydrated = $state(false);
+	let uiPrefsHydrated = $state(false);
+	let uiColorScheme = $state<UiColorScheme>('system');
+	let uiFontSize = $state<UiFontSize>('md');
+	let uiDensity = $state<UiDensity>('comfortable');
+	let uiSaveTimer: number | null = null;
+
+	let isDesktop = $state(true);
 
 	let providerCache: ProviderCache = {
 		openai: {
@@ -565,12 +584,202 @@
 	let keepUnfilledPlaceholders = $state(true);
 
 	let promptTextareaEl = $state<HTMLTextAreaElement | null>(null);
+	let lastDrawerFocusEl: HTMLElement | null = null;
+	let lastModalFocusEl: HTMLElement | null = null;
+
+	let conversationsPanelEl = $state<HTMLElement | null>(null);
+	let settingsPanelEl = $state<HTMLElement | null>(null);
+	let promptTemplatesModalEl = $state<HTMLDivElement | null>(null);
+
+	let convSearchEl = $state<HTMLInputElement | null>(null);
+	let providerSelectEl = $state<HTMLSelectElement | null>(null);
+	let tmplSearchEl = $state<HTMLInputElement | null>(null);
+
+	const EDGE_SWIPE_PX = 20;
+	const SWIPE_TRIGGER_PX = 40;
+	const SWIPE_DIRECTION_LOCK_RATIO = 1.2;
+	let swipeMode: null | 'open-left' | 'open-right' | 'close-left' | 'close-right' = null;
+	let swipeStartX = 0;
+	let swipeStartY = 0;
+	let swipePointerId: number | null = null;
+
+	function captureDrawerFocus() {
+		if (isDesktop) return;
+		if (lastDrawerFocusEl) return;
+		if (typeof document === 'undefined') return;
+		const el = document.activeElement;
+		lastDrawerFocusEl = el instanceof HTMLElement ? el : null;
+	}
+
+	function captureModalFocus() {
+		if (typeof document === 'undefined') return;
+		const el = document.activeElement;
+		lastModalFocusEl = el instanceof HTMLElement ? el : null;
+	}
+
+	async function restoreDrawerFocus() {
+		if (!lastDrawerFocusEl) return;
+		await tick();
+		try {
+			lastDrawerFocusEl.focus();
+		} catch {
+			// 忽略：焦点目标可能已卸载
+		}
+		lastDrawerFocusEl = null;
+	}
+
+	async function restoreModalFocus() {
+		if (!lastModalFocusEl) return;
+		await tick();
+		try {
+			lastModalFocusEl.focus();
+		} catch {
+			// 忽略：焦点目标可能已卸载
+		}
+		lastModalFocusEl = null;
+	}
+
+	function getActiveFocusTrapContainer(): HTMLElement | null {
+		if (promptTemplatesOpen) return promptTemplatesModalEl;
+		if (!isDesktop && conversationsOpen) return conversationsPanelEl;
+		if (!isDesktop && settingsOpen) return settingsPanelEl;
+		return null;
+	}
+
+	function getFocusableElements(container: HTMLElement): HTMLElement[] {
+		const list = Array.from(
+			container.querySelectorAll<HTMLElement>(
+				'a[href],button,textarea,input,select,summary,[tabindex]:not([tabindex="-1"])'
+			)
+		);
+
+		return list.filter((el) => {
+			if (!(el instanceof HTMLElement)) return false;
+			if (el.hasAttribute('disabled')) return false;
+			const tab = el.getAttribute('tabindex');
+			if (tab === '-1') return false;
+			return true;
+		});
+	}
+
+	function resetSwipe() {
+		swipeMode = null;
+		swipePointerId = null;
+	}
+
+	function handleGlobalPointerDown(e: PointerEvent) {
+		if (isDesktop) return;
+		if (promptTemplatesOpen) return;
+		if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
+
+		const vw = typeof window !== 'undefined' ? window.innerWidth : 0;
+		if (vw <= 0) return;
+
+		const x = e.clientX;
+		swipeStartX = e.clientX;
+		swipeStartY = e.clientY;
+		swipePointerId = e.pointerId;
+
+		if (!conversationsOpen && !settingsOpen) {
+			if (x <= EDGE_SWIPE_PX) swipeMode = 'open-left';
+			else if (x >= vw - EDGE_SWIPE_PX) swipeMode = 'open-right';
+			else resetSwipe();
+			return;
+		}
+
+		if (conversationsOpen) swipeMode = 'close-left';
+		else if (settingsOpen) swipeMode = 'close-right';
+		else resetSwipe();
+	}
+
+	function handleGlobalPointerMove(e: PointerEvent) {
+		if (!swipeMode) return;
+		if (swipePointerId !== e.pointerId) return;
+
+		const dx = e.clientX - swipeStartX;
+		const dy = e.clientY - swipeStartY;
+
+		if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
+		if (Math.abs(dx) < Math.abs(dy) * SWIPE_DIRECTION_LOCK_RATIO) {
+			// 更像纵向滚动：不打断用户
+			resetSwipe();
+			return;
+		}
+
+		if (swipeMode === 'open-left' && dx > SWIPE_TRIGGER_PX) {
+			openConversationsPanel();
+			resetSwipe();
+			return;
+		}
+		if (swipeMode === 'open-right' && dx < -SWIPE_TRIGGER_PX) {
+			openSettingsPanel();
+			resetSwipe();
+			return;
+		}
+		if (swipeMode === 'close-left' && dx < -SWIPE_TRIGGER_PX) {
+			closePanels();
+			resetSwipe();
+			return;
+		}
+		if (swipeMode === 'close-right' && dx > SWIPE_TRIGGER_PX) {
+			closePanels();
+			resetSwipe();
+			return;
+		}
+	}
+
+	function handleGlobalPointerUp(e: PointerEvent) {
+		if (swipePointerId !== e.pointerId) return;
+		resetSwipe();
+	}
+
+	function handleGlobalPointerCancel(e: PointerEvent) {
+		if (swipePointerId !== e.pointerId) return;
+		resetSwipe();
+	}
 
 	function handleGlobalKeydown(e: KeyboardEvent) {
-		if (e.key !== 'Escape') return;
-		settingsOpen = false;
-		conversationsOpen = false;
-		promptTemplatesOpen = false;
+		if (e.key === 'Escape') {
+			if (promptTemplatesOpen) {
+				e.preventDefault();
+				closePromptTemplatesModal();
+				return;
+			}
+			if (!isDesktop && (settingsOpen || conversationsOpen)) {
+				e.preventDefault();
+				closePanels();
+				return;
+			}
+			return;
+		}
+
+		if (e.key !== 'Tab') return;
+		if (typeof document === 'undefined') return;
+
+		const container = getActiveFocusTrapContainer();
+		if (!container) return;
+
+		const focusables = getFocusableElements(container);
+		if (!focusables.length) {
+			e.preventDefault();
+			container.focus?.();
+			return;
+		}
+
+		const active = document.activeElement;
+		const idx = active instanceof HTMLElement ? focusables.indexOf(active) : -1;
+		if (e.shiftKey) {
+			if (idx <= 0) {
+				e.preventDefault();
+				focusables[focusables.length - 1].focus();
+			}
+			return;
+		}
+
+		if (idx === -1 || idx === focusables.length - 1) {
+			e.preventDefault();
+			focusables[0].focus();
+		}
 	}
 
 	async function copyToClipboard(text: string) {
@@ -698,21 +907,38 @@
 		schedulePersistCurrentConversation();
 	}
 
-	function openSettingsPanel() {
+	async function openSettingsPanel() {
+		captureDrawerFocus();
 		settingsOpen = true;
 		conversationsOpen = false;
 		rightPanelTab = 'settings';
+
+		if (isDesktop) return;
+		await tick();
+		providerSelectEl?.focus();
+		settingsPanelEl?.focus();
 	}
 
-	function openDebugPanel() {
+	async function openDebugPanel() {
+		captureDrawerFocus();
 		settingsOpen = true;
 		conversationsOpen = false;
 		rightPanelTab = 'debug';
+
+		if (isDesktop) return;
+		await tick();
+		settingsPanelEl?.focus();
 	}
 
-	function openConversationsPanel() {
+	async function openConversationsPanel() {
+		captureDrawerFocus();
 		conversationsOpen = true;
 		settingsOpen = false;
+
+		if (isDesktop) return;
+		await tick();
+		convSearchEl?.focus();
+		conversationsPanelEl?.focus();
 	}
 
 	function startSidebarResize(side: 'left' | 'right', e: PointerEvent) {
@@ -771,9 +997,35 @@
 		e.stopPropagation();
 	}
 
-	function closePanels() {
+	function handleSidebarSeparatorKeydown(side: 'left' | 'right', e: KeyboardEvent) {
+		if (!isDesktopViewport()) return;
+		if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+
+		const step = e.shiftKey ? 48 : 16;
+		const vw = getViewportWidth();
+		if (vw <= 0) return;
+
+		e.preventDefault();
+		e.stopPropagation();
+
+		if (side === 'left') {
+			const max = Math.max(LEFT_SIDEBAR_MIN_PX, Math.min(LEFT_SIDEBAR_MAX_PX, vw - rightSidebarWidth - CENTER_MIN_PX));
+			const delta = e.key === 'ArrowRight' ? step : -step;
+			leftSidebarWidth = Math.round(clamp(leftSidebarWidth + delta, LEFT_SIDEBAR_MIN_PX, max));
+		} else {
+			const max = Math.max(RIGHT_SIDEBAR_MIN_PX, Math.min(RIGHT_SIDEBAR_MAX_PX, vw - leftSidebarWidth - CENTER_MIN_PX));
+			const delta = e.key === 'ArrowLeft' ? step : -step;
+			rightSidebarWidth = Math.round(clamp(rightSidebarWidth + delta, RIGHT_SIDEBAR_MIN_PX, max));
+		}
+
+		writeLayout({ v: 1, leftSidebarWidth, rightSidebarWidth });
+	}
+
+	async function closePanels() {
+		const shouldRestore = !isDesktop && (settingsOpen || conversationsOpen);
 		settingsOpen = false;
 		conversationsOpen = false;
+		if (shouldRestore) await restoreDrawerFocus();
 	}
 
 	function createConversation() {
@@ -1164,18 +1416,24 @@
 		keepUnfilledPlaceholders = true;
 	}
 
-	function openPromptTemplatesModal() {
+	async function openPromptTemplatesModal() {
 		if (streaming) return;
+		captureModalFocus();
 		promptTemplatesOpen = true;
 		promptTemplatesQuery = '';
 		promptTemplatesTab = promptTemplates.recent.length ? 'recent' : promptTemplates.favorites.length ? 'favorites' : 'all';
 
 		const first = getVisiblePromptTemplates()[0];
 		if (first) selectPromptTemplate(first.id);
+
+		await tick();
+		tmplSearchEl?.focus();
+		promptTemplatesModalEl?.focus();
 	}
 
-	function closePromptTemplatesModal() {
+	async function closePromptTemplatesModal() {
 		promptTemplatesOpen = false;
+		await restoreModalFocus();
 	}
 
 	function toggleTemplateFavorite(id: string) {
@@ -1873,6 +2131,36 @@
 	}
 
 	onMount(() => {
+		// UI 偏好（主题/字号/密度）：首屏已在 app.html 中抢先应用，这里用于同步到状态并兜底
+		try {
+			const savedUi = readUiPrefs(localStorage);
+			const ui = (savedUi ?? createDefaultUiPrefs()) as StoredUiPrefsV1;
+			uiColorScheme = ui.colorScheme;
+			uiFontSize = ui.fontSize;
+			uiDensity = ui.density;
+			applyUiPrefsToRoot(document.documentElement, ui);
+		} catch {
+			const ui = createDefaultUiPrefs() as StoredUiPrefsV1;
+			uiColorScheme = ui.colorScheme;
+			uiFontSize = ui.fontSize;
+			uiDensity = ui.density;
+		}
+		uiPrefsHydrated = true;
+
+		let desktopMql: MediaQueryList | null = null;
+		let desktopMqlListener: (() => void) | null = null;
+		try {
+			desktopMql = window.matchMedia(`(min-width: ${DESKTOP_BREAKPOINT_PX + 1}px)`);
+			desktopMqlListener = () => {
+				isDesktop = !!desktopMql?.matches;
+			};
+			desktopMqlListener();
+			if (typeof desktopMql.addEventListener === 'function') desktopMql.addEventListener('change', desktopMqlListener);
+			else (desktopMql as any).addListener?.(desktopMqlListener);
+		} catch {
+			isDesktop = isDesktopViewport();
+		}
+
 			const saved = readSettings();
 			if (saved) {
 				providerCache.openai.baseUrl = saved.openai.baseUrl;
@@ -2013,7 +2301,13 @@
 			}
 		}
 
-		return () => window.removeEventListener('resize', handleResize);
+		return () => {
+			window.removeEventListener('resize', handleResize);
+			if (desktopMql && desktopMqlListener) {
+				if (typeof desktopMql.removeEventListener === 'function') desktopMql.removeEventListener('change', desktopMqlListener);
+				else (desktopMql as any).removeListener?.(desktopMqlListener);
+			}
+		};
 	});
 
 	onMount(() => {
@@ -2080,6 +2374,24 @@
 				}
 			});
 		}, 250);
+	});
+
+	$effect(() => {
+		if (!uiPrefsHydrated) return;
+
+		uiColorScheme;
+		uiFontSize;
+		uiDensity;
+
+		const prefs: StoredUiPrefsV1 = { v: 1, colorScheme: uiColorScheme, fontSize: uiFontSize, density: uiDensity };
+		try {
+			applyUiPrefsToRoot(document.documentElement, prefs);
+		} catch {
+			// 忽略：极端环境可能不存在 document
+		}
+
+		if (uiSaveTimer) window.clearTimeout(uiSaveTimer);
+		uiSaveTimer = window.setTimeout(() => writeUiPrefs(localStorage, prefs), 150);
 	});
 
 	function fmtTime(ts: number) {
@@ -2934,13 +3246,30 @@
 	}
 </script>
 
-<svelte:window onkeydown={handleGlobalKeydown} />
+<svelte:window
+	onkeydown={handleGlobalKeydown}
+	onpointerdown={handleGlobalPointerDown}
+	onpointermove={handleGlobalPointerMove}
+	onpointerup={handleGlobalPointerUp}
+	onpointercancel={handleGlobalPointerCancel}
+/>
 
 <div class="container">
+	<a class="skip-link" href="#prompt">跳到输入框</a>
 	<div class="grid" style={`--left-sidebar-width: ${leftSidebarWidth}px; --right-sidebar-width: ${rightSidebarWidth}px;`}>
-		<aside class="conversations-panel" class:open={conversationsOpen}>
+		<aside
+			id="conversationsPanel"
+			class="conversations-panel"
+			class:open={conversationsOpen}
+			bind:this={conversationsPanelEl}
+			tabindex="-1"
+			role={!isDesktop ? 'dialog' : undefined}
+			aria-modal={!isDesktop ? 'true' : undefined}
+			aria-labelledby="conversationsPanelTitle"
+			aria-hidden={!isDesktop && !conversationsOpen ? 'true' : undefined}
+		>
 			<div class="panel-header">
-				<h2>会话</h2>
+				<h2 id="conversationsPanelTitle">会话</h2>
 				<div class="panel-header-actions">
 					<button class="btn btn-sm" type="button" onclick={createConversation} disabled={streaming}>
 						新建
@@ -2958,6 +3287,7 @@
 					<label for="convSearch">搜索</label>
 					<input
 						id="convSearch"
+						bind:this={convSearchEl}
 						bind:value={conversationQuery}
 						placeholder="按标题/内容搜索"
 						disabled={streaming}
@@ -3044,11 +3374,16 @@
 		<div
 			class="col-resizer col-resizer-left"
 			class:dragging={resizingSidebar === 'left'}
-			role="separator"
+			role="slider"
 			aria-label="调整会话栏宽度"
 			aria-orientation="vertical"
+			aria-valuemin={LEFT_SIDEBAR_MIN_PX}
+			aria-valuemax={LEFT_SIDEBAR_MAX_PX}
+			aria-valuenow={leftSidebarWidth}
+			tabindex="0"
 			title="拖拽调整宽度"
 			onpointerdown={(e) => startSidebarResize('left', e)}
+			onkeydown={(e) => handleSidebarSeparatorKeydown('left', e)}
 		></div>
 
 		<section class="chat-area" bind:this={chatAreaEl}>
@@ -3062,10 +3397,24 @@
 					</p>
 				</div>
 				<div class="chat-actions">
-					<button class="btn btn-sm conversations-toggle" type="button" onclick={openConversationsPanel}>
+					<button
+						class="btn btn-sm conversations-toggle"
+						type="button"
+						onclick={openConversationsPanel}
+						aria-controls="conversationsPanel"
+						aria-expanded={!isDesktop && conversationsOpen}
+						aria-haspopup="dialog"
+					>
 						会话
 					</button>
-					<button class="btn btn-sm settings-toggle" type="button" onclick={openSettingsPanel}>
+					<button
+						class="btn btn-sm settings-toggle"
+						type="button"
+						onclick={openSettingsPanel}
+						aria-controls="settingsPanel"
+						aria-expanded={!isDesktop && settingsOpen}
+						aria-haspopup="dialog"
+					>
 						设置
 					</button>
 				</div>
@@ -3073,10 +3422,10 @@
 
 			<div class="messages" bind:this={messagesEl} onscroll={syncStickToBottom} use:delegateCopy>
 				{#if notice}
-					<div class="notice">{notice}</div>
+					<div class="notice" role="status" aria-live="polite">{notice}</div>
 				{/if}
 				{#if error}
-					<div class="error">{error}</div>
+					<div class="error" role="alert">{error}</div>
 				{/if}
 
 				{#if messages.length === 0}
@@ -3378,20 +3727,35 @@
 		<div
 			class="col-resizer col-resizer-right"
 			class:dragging={resizingSidebar === 'right'}
-			role="separator"
+			role="slider"
 			aria-label="调整设置栏宽度"
 			aria-orientation="vertical"
+			aria-valuemin={RIGHT_SIDEBAR_MIN_PX}
+			aria-valuemax={RIGHT_SIDEBAR_MAX_PX}
+			aria-valuenow={rightSidebarWidth}
+			tabindex="0"
 			title="拖拽调整宽度"
 			onpointerdown={(e) => startSidebarResize('right', e)}
+			onkeydown={(e) => handleSidebarSeparatorKeydown('right', e)}
 		></div>
 
 		{#if settingsOpen || conversationsOpen}
 			<button class="settings-overlay" type="button" aria-label="关闭面板" onclick={closePanels}></button>
 		{/if}
 
-			<aside class="settings-panel" class:open={settingsOpen}>
+			<aside
+				id="settingsPanel"
+				class="settings-panel"
+				class:open={settingsOpen}
+				bind:this={settingsPanelEl}
+				tabindex="-1"
+				role={!isDesktop ? 'dialog' : undefined}
+				aria-modal={!isDesktop ? 'true' : undefined}
+				aria-labelledby="settingsPanelTitle"
+				aria-hidden={!isDesktop && !settingsOpen ? 'true' : undefined}
+			>
 				<div class="panel-header">
-					<h2>{rightPanelTab === 'settings' ? '运行设置' : '调试面板'}</h2>
+					<h2 id="settingsPanelTitle">{rightPanelTab === 'settings' ? '运行设置' : '调试面板'}</h2>
 					<div class="panel-header-actions">
 						<span class="pill">{streaming ? '生成中' : '空闲'}</span>
 						<button class="btn btn-sm panel-close" type="button" onclick={closePanels}>
@@ -3519,11 +3883,43 @@
 
 						<div class="muted">提示：导出/分享默认不包含明文 API Key；Profile 可能包含 system prompt 等敏感信息，请谨慎分享。</div>
 					</div>
+
+					<div class="field-group">
+						<div class="field">
+							<label for="uiColorScheme">主题</label>
+							<select id="uiColorScheme" bind:value={uiColorScheme}>
+								<option value="system">跟随系统</option>
+								<option value="light">浅色</option>
+								<option value="dark">深色</option>
+							</select>
+						</div>
+
+						<div class="field">
+							<label for="uiFontSize">字号</label>
+							<select id="uiFontSize" bind:value={uiFontSize}>
+								<option value="sm">小</option>
+								<option value="md">中</option>
+								<option value="lg">大</option>
+							</select>
+						</div>
+
+						<div class="field">
+							<label for="uiDensity">密度</label>
+							<select id="uiDensity" bind:value={uiDensity}>
+								<option value="compact">紧凑</option>
+								<option value="comfortable">舒适</option>
+								<option value="spacious">宽松</option>
+							</select>
+						</div>
+
+						<div class="muted">说明：主题支持跟随系统；字号与密度仅影响本地显示，不会影响 API 请求。</div>
+					</div>
 					<div class="field-group">
 						<div class="field">
 							<label for="provider">提供方</label>
 							<select
 								id="provider"
+								bind:this={providerSelectEl}
 								bind:value={provider}
 								onchange={() => switchProvider(provider)}
 								disabled={streaming}
@@ -3968,7 +4364,7 @@
 
 	{#if promptTemplatesOpen}
 		<button class="modal-overlay" type="button" aria-label="关闭模板库" onclick={closePromptTemplatesModal}></button>
-		<div class="modal" role="dialog" aria-modal="true" aria-label="Prompt 模板库">
+		<div class="modal" role="dialog" aria-modal="true" aria-label="Prompt 模板库" bind:this={promptTemplatesModalEl} tabindex="-1">
 			<div class="modal-header">
 				<h3>Prompt 模板库</h3>
 				<div class="modal-header-actions">
@@ -3996,6 +4392,7 @@
 						<label for="tmplSearch">搜索</label>
 						<input
 							id="tmplSearch"
+							bind:this={tmplSearchEl}
 							bind:value={promptTemplatesQuery}
 							placeholder="按标题/内容搜索"
 							autocapitalize="off"
