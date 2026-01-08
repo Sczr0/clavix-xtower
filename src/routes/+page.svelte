@@ -35,6 +35,17 @@
 		writeProfiles
 	} from '$lib/profiles';
 	import {
+		DEFAULT_PROMPT_TEMPLATES,
+		deleteUserPromptTemplate,
+		markPromptTemplateUsed,
+		parseTemplateVariables,
+		readPromptTemplates,
+		renderTemplate,
+		togglePromptTemplateFavorite,
+		upsertUserPromptTemplate,
+		writePromptTemplates
+	} from '$lib/prompt-templates';
+	import {
 		createAnthropicSseContext,
 		createThoughtChainSplitter,
 		parseAnthropicSseEvent,
@@ -191,6 +202,30 @@
 		v: 1;
 		currentId: string | null;
 		items: Profile[];
+	};
+
+	type UserPromptTemplateV1 = {
+		id: string;
+		title: string;
+		content: string;
+		createdAt: number;
+		updatedAt: number;
+	};
+
+	type StoredPromptTemplatesV1 = {
+		v: 1;
+		items: UserPromptTemplateV1[];
+		favorites: string[];
+		recent: string[];
+	};
+
+	type PromptTemplateView = {
+		id: string;
+		title: string;
+		content: string;
+		builtin: boolean;
+		createdAt?: number;
+		updatedAt?: number;
 	};
 
 	const DESKTOP_BREAKPOINT_PX = 980;
@@ -425,10 +460,25 @@
 	let profilesImportText = $state('');
 	let profilesImportInputEl = $state<HTMLInputElement | null>(null);
 
+	// Prompt 模板库资产化（localStorage v1；内置模板只读）
+	let promptTemplatesHydrated = $state(false);
+	let promptTemplates = $state<StoredPromptTemplatesV1>({ v: 1, items: [], favorites: [], recent: [] });
+	let promptTemplatesOpen = $state(false);
+	let promptTemplatesTab = $state<'all' | 'favorites' | 'recent'>('all');
+	let promptTemplatesQuery = $state('');
+	let selectedTemplateId = $state('');
+	let templateDraftTitle = $state('');
+	let templateDraftContent = $state('');
+	let templateVarValues = $state<Record<string, string>>({});
+	let keepUnfilledPlaceholders = $state(true);
+
+	let promptTextareaEl = $state<HTMLTextAreaElement | null>(null);
+
 	function handleGlobalKeydown(e: KeyboardEvent) {
 		if (e.key !== 'Escape') return;
 		settingsOpen = false;
 		conversationsOpen = false;
+		promptTemplatesOpen = false;
 	}
 
 	async function copyToClipboard(text: string) {
@@ -898,6 +948,174 @@
 		} catch {
 			// localStorage 可能被禁用（隐私模式/策略）
 		}
+	}
+
+	function persistPromptTemplates(next: StoredPromptTemplatesV1 = promptTemplates) {
+		if (!promptTemplatesHydrated) return;
+		try {
+			writePromptTemplates(localStorage, next as any);
+		} catch {
+			// localStorage 可能被禁用（隐私模式/策略）
+		}
+	}
+
+	function buildAllPromptTemplates(): PromptTemplateView[] {
+		const builtins: PromptTemplateView[] = DEFAULT_PROMPT_TEMPLATES.map((t) => ({ ...t, builtin: true }));
+		const users: PromptTemplateView[] = [...promptTemplates.items]
+			.sort((a, b) => {
+				if (b.updatedAt !== a.updatedAt) return b.updatedAt - a.updatedAt;
+				if (b.createdAt !== a.createdAt) return b.createdAt - a.createdAt;
+				return a.title.localeCompare(b.title);
+			})
+			.map((t) => ({ ...t, builtin: false }));
+		return [...builtins, ...users];
+	}
+
+	function getPromptTemplateById(id: string): PromptTemplateView | null {
+		const tid = safeString(id, '').trim();
+		if (!tid) return null;
+		const builtin = DEFAULT_PROMPT_TEMPLATES.find((t) => t.id === tid);
+		if (builtin) return { ...builtin, builtin: true };
+		const user = promptTemplates.items.find((t) => t.id === tid);
+		return user ? { ...user, builtin: false } : null;
+	}
+
+	function isPromptTemplateFavorite(id: string) {
+		const tid = safeString(id, '').trim();
+		if (!tid) return false;
+		return promptTemplates.favorites.includes(tid);
+	}
+
+	function listTemplatesByIds(ids: string[]): PromptTemplateView[] {
+		const out: PromptTemplateView[] = [];
+		for (const id of ids) {
+			const t = getPromptTemplateById(id);
+			if (t) out.push(t);
+		}
+		return out;
+	}
+
+	function getVisiblePromptTemplates(): PromptTemplateView[] {
+		const tab = promptTemplatesTab;
+		const base =
+			tab === 'recent'
+				? listTemplatesByIds(promptTemplates.recent)
+				: tab === 'favorites'
+					? listTemplatesByIds(promptTemplates.favorites)
+					: buildAllPromptTemplates();
+
+		const q = promptTemplatesQuery.trim().toLowerCase();
+		if (!q) return base;
+		return base.filter((t) => t.title.toLowerCase().includes(q) || t.content.toLowerCase().includes(q));
+	}
+
+	function selectPromptTemplate(id: string) {
+		const t = getPromptTemplateById(id);
+		if (!t) {
+			selectedTemplateId = '';
+			templateDraftTitle = '';
+			templateDraftContent = '';
+			templateVarValues = {};
+			keepUnfilledPlaceholders = true;
+			return;
+		}
+		selectedTemplateId = t.id;
+		templateDraftTitle = t.title;
+		templateDraftContent = t.content;
+		templateVarValues = {};
+		keepUnfilledPlaceholders = true;
+	}
+
+	function openPromptTemplatesModal() {
+		if (streaming) return;
+		promptTemplatesOpen = true;
+		promptTemplatesQuery = '';
+		promptTemplatesTab = promptTemplates.recent.length ? 'recent' : promptTemplates.favorites.length ? 'favorites' : 'all';
+
+		const first = getVisiblePromptTemplates()[0];
+		if (first) selectPromptTemplate(first.id);
+	}
+
+	function closePromptTemplatesModal() {
+		promptTemplatesOpen = false;
+	}
+
+	function toggleTemplateFavorite(id: string) {
+		const tid = safeString(id, '').trim();
+		if (!tid) return;
+		promptTemplates = togglePromptTemplateFavorite(promptTemplates as any, tid) as any;
+		persistPromptTemplates();
+	}
+
+	function createUserTemplate() {
+		if (streaming) return;
+		promptTemplates = upsertUserPromptTemplate(promptTemplates as any, { title: '新模板', content: '' }, { now: Date.now() }) as any;
+		persistPromptTemplates();
+		promptTemplatesTab = 'all';
+		promptTemplatesQuery = '';
+		const id = promptTemplates.items[0]?.id ?? '';
+		if (id) selectPromptTemplate(id);
+	}
+
+	function saveSelectedUserTemplate() {
+		const current = getPromptTemplateById(selectedTemplateId);
+		if (!current || current.builtin) return;
+		promptTemplates = upsertUserPromptTemplate(
+			promptTemplates as any,
+			{ id: current.id, title: templateDraftTitle, content: templateDraftContent },
+			{ now: Date.now() }
+		) as any;
+		persistPromptTemplates();
+		showNotice('已保存模板');
+	}
+
+	function deleteSelectedUserTemplate() {
+		const current = getPromptTemplateById(selectedTemplateId);
+		if (!current || current.builtin) return;
+		const ok = window.confirm(`确定删除模板「${current.title}」吗？此操作不可恢复。`);
+		if (!ok) return;
+		promptTemplates = deleteUserPromptTemplate(promptTemplates as any, current.id) as any;
+		persistPromptTemplates();
+		showNotice('已删除模板');
+
+		const first = getVisiblePromptTemplates()[0];
+		selectPromptTemplate(first?.id ?? '');
+	}
+
+	async function insertPromptText(text: string) {
+		const t = safeString(text, '').replaceAll('\r', '').trim();
+		if (!t) return;
+
+		const el = promptTextareaEl;
+		if (el && typeof el.selectionStart === 'number' && typeof el.selectionEnd === 'number') {
+			const start = el.selectionStart;
+			const end = el.selectionEnd;
+			prompt = `${prompt.slice(0, start)}${t}${prompt.slice(end)}`;
+			await tick();
+			el.focus();
+			const pos = start + t.length;
+			el.selectionStart = pos;
+			el.selectionEnd = pos;
+			return;
+		}
+
+		prompt = prompt.trim() ? `${prompt}\n\n${t}` : t;
+		await tick();
+		promptTextareaEl?.focus();
+	}
+
+	async function insertSelectedTemplate() {
+		if (streaming) return;
+		const current = getPromptTemplateById(selectedTemplateId);
+		if (!current) return;
+
+		const rendered = renderTemplate(templateDraftContent, templateVarValues, { keepUnfilled: keepUnfilledPlaceholders });
+		await insertPromptText(rendered);
+
+		promptTemplates = markPromptTemplateUsed(promptTemplates as any, current.id, { maxRecent: 20 }) as any;
+		persistPromptTemplates();
+		closePromptTemplatesModal();
+		showNotice(`已插入模板：「${current.title}」`);
 	}
 
 	function makeUniqueProfileName(raw: string, ignoreId: string | null = null) {
@@ -1568,6 +1786,14 @@
 			activeProfileId = '';
 		}
 		profilesHydrated = true;
+
+		// Prompt 模板库（localStorage v1）
+		try {
+			promptTemplates = (readPromptTemplates(localStorage) ?? { v: 1, items: [], favorites: [], recent: [] }) as any;
+		} catch {
+			promptTemplates = { v: 1, items: [], favorites: [], recent: [] };
+		}
+		promptTemplatesHydrated = true;
 
 		// 分享链接导入：#debug=...（默认导入为摘要版；导入成功后清理 hash，避免后续误分享/重复导入）
 		const imported = typeof location !== 'undefined' ? decodeDebugReportFromHash(location.hash) : null;
@@ -2304,6 +2530,7 @@
 				<div class="composer">
 					<textarea
 						id="prompt"
+						bind:this={promptTextareaEl}
 						bind:value={prompt}
 						placeholder="输入提示词..."
 						disabled={streaming}
@@ -2314,6 +2541,31 @@
 						}}
 					></textarea>
 					<div class="composer-actions">
+						<button
+							class="btn-icon btn-icon-secondary"
+							type="button"
+							onclick={openPromptTemplatesModal}
+							disabled={streaming}
+							aria-label="模板库"
+						>
+							<svg
+								xmlns="http://www.w3.org/2000/svg"
+								width="20"
+								height="20"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+								stroke-linecap="round"
+								stroke-linejoin="round"
+							>
+								<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+								<polyline points="14 2 14 8 20 8" />
+								<line x1="16" y1="13" x2="8" y2="13" />
+								<line x1="16" y1="17" x2="8" y2="17" />
+								<line x1="10" y1="9" x2="8" y2="9" />
+							</svg>
+						</button>
 						<button class="btn-icon" type="button" onclick={send} disabled={streaming || !prompt.trim()} aria-label="发送">
 							<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
 						</button>
@@ -2800,4 +3052,147 @@
 				{/if}
 		</aside>
 	</div>
+
+	{#if promptTemplatesOpen}
+		<button class="modal-overlay" type="button" aria-label="关闭模板库" onclick={closePromptTemplatesModal}></button>
+		<div class="modal" role="dialog" aria-modal="true" aria-label="Prompt 模板库">
+			<div class="modal-header">
+				<h3>Prompt 模板库</h3>
+				<div class="modal-header-actions">
+					<button class="btn btn-sm" type="button" onclick={createUserTemplate} disabled={streaming}>新建</button>
+					<button class="btn btn-sm" type="button" onclick={closePromptTemplatesModal}>关闭</button>
+				</div>
+			</div>
+			<div class="panel-tabs modal-tabs">
+				<button class="tab" type="button" class:active={promptTemplatesTab === 'all'} onclick={() => (promptTemplatesTab = 'all')}>全部</button>
+				<button
+					class="tab"
+					type="button"
+					class:active={promptTemplatesTab === 'favorites'}
+					onclick={() => (promptTemplatesTab = 'favorites')}
+				>
+					收藏
+				</button>
+				<button class="tab" type="button" class:active={promptTemplatesTab === 'recent'} onclick={() => (promptTemplatesTab = 'recent')}>
+					最近
+				</button>
+			</div>
+			<div class="modal-body tmpl-modal-body">
+				<div class="tmpl-col tmpl-list-col">
+					<div class="field">
+						<label for="tmplSearch">搜索</label>
+						<input
+							id="tmplSearch"
+							bind:value={promptTemplatesQuery}
+							placeholder="按标题/内容搜索"
+							autocapitalize="off"
+							autocomplete="off"
+							spellcheck="false"
+						/>
+					</div>
+
+					<div class="tmpl-list">
+						{#each getVisiblePromptTemplates() as t (t.id)}
+							<div class="tmpl-item" class:active={t.id === selectedTemplateId}>
+								<button class="tmpl-select" type="button" onclick={() => selectPromptTemplate(t.id)}>
+									<div class="tmpl-title-row">
+										<span class="tmpl-title">{t.title}</span>
+										{#if t.builtin}
+											<span class="pill">内置</span>
+										{/if}
+									</div>
+									<div class="tmpl-snippet muted">{truncateText(t.content, 70)}</div>
+								</button>
+								<button class="tmpl-star" type="button" onclick={() => toggleTemplateFavorite(t.id)} aria-label="收藏/取消收藏">
+									{isPromptTemplateFavorite(t.id) ? '★' : '☆'}
+								</button>
+							</div>
+						{/each}
+
+						{#if getVisiblePromptTemplates().length === 0}
+							<div class="muted">暂无匹配模板</div>
+						{/if}
+					</div>
+				</div>
+
+				<div class="tmpl-col tmpl-detail-col">
+					{#if getPromptTemplateById(selectedTemplateId)}
+						<div class="tmpl-detail-head">
+							<div class="tmpl-detail-title-row">
+								<input bind:value={templateDraftTitle} disabled={getPromptTemplateById(selectedTemplateId)?.builtin} />
+								<button
+									class="btn btn-sm"
+									type="button"
+									onclick={() => toggleTemplateFavorite(selectedTemplateId)}
+									disabled={!selectedTemplateId}
+								>
+									{isPromptTemplateFavorite(selectedTemplateId) ? '已收藏' : '收藏'}
+								</button>
+							</div>
+							<div class="tmpl-detail-meta muted">
+								{getPromptTemplateById(selectedTemplateId)?.builtin ? '内置模板（只读）' : '自定义模板'}
+							</div>
+						</div>
+
+						<div class="field">
+							<label for="tmplContent">内容</label>
+							<textarea
+								id="tmplContent"
+								bind:value={templateDraftContent}
+								rows="10"
+								disabled={getPromptTemplateById(selectedTemplateId)?.builtin}
+								placeholder={"输入模板内容，可使用 {topic} 等占位符"}
+							></textarea>
+						</div>
+
+						{#if !getPromptTemplateById(selectedTemplateId)?.builtin}
+							<div class="tmpl-detail-actions">
+								<button class="btn btn-sm" type="button" onclick={saveSelectedUserTemplate} disabled={streaming}>保存</button>
+								<button class="btn btn-sm danger" type="button" onclick={deleteSelectedUserTemplate} disabled={streaming}>删除</button>
+							</div>
+						{/if}
+
+						<div class="tmpl-vars">
+							<div class="label-row">
+								<span class="muted">变量</span>
+								<label class="checkbox">
+									<input type="checkbox" bind:checked={keepUnfilledPlaceholders} />
+									<span class="muted">未填写保留占位符</span>
+								</label>
+							</div>
+
+							{#if parseTemplateVariables(templateDraftContent).length}
+								<div class="tmpl-vars-grid">
+									{#each parseTemplateVariables(templateDraftContent) as v (v)}
+										<div class="field">
+											<label for={"var-" + v}>{v}</label>
+											<input
+												id={"var-" + v}
+												value={templateVarValues[v] ?? ''}
+												placeholder={`填写 ${v}`}
+												oninput={(e) => {
+													const target = e.currentTarget as HTMLInputElement;
+													templateVarValues = { ...templateVarValues, [v]: target.value };
+												}}
+											/>
+										</div>
+									{/each}
+								</div>
+							{:else}
+								<div class="muted">此模板未检测到变量占位符</div>
+							{/if}
+						</div>
+
+						<div class="tmpl-insert-actions">
+							<button class="btn" type="button" onclick={insertSelectedTemplate} disabled={streaming || !selectedTemplateId}>
+								插入到输入框
+							</button>
+						</div>
+					{:else}
+						<div class="muted">请选择一个模板</div>
+					{/if}
+				</div>
+			</div>
+		</div>
+	{/if}
 </div>
