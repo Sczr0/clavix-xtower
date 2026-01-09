@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { browser } from '$app/environment';
 	import { onMount, tick } from 'svelte';
 	import { streamSse, type SseEvent } from '$lib/sse';
 	import { renderMarkdownToHtml } from '$lib/markdown';
@@ -54,6 +55,8 @@
 	} from '$lib/thought-chain';
 	import { estimateUsdCost, formatUsd } from '$lib/cost.js';
 	import { applyUiPrefsToRoot, createDefaultUiPrefs, readUiPrefs, writeUiPrefs } from '$lib/ui-prefs.js';
+	import { normalizeCompareTargetIds as normalizeCompareTargetIdsPure, toggleCompareTargetId } from '$lib/compare.js';
+	import { formatRelativeTime } from '$lib/time.js';
 
 	type Provider = 'openai' | 'anthropic';
 	type Role = 'user' | 'assistant';
@@ -229,6 +232,18 @@
 		density: UiDensity;
 	};
 
+	// 在 ssr=false 的 SPA 模式下：尽早从 localStorage 读出 UI 偏好，避免首屏状态与实际样式不一致，
+	// 也避免用户刚改完就被 onMount 再次写回旧值而误判“设置不生效”。
+	const INITIAL_UI_PREFS: StoredUiPrefsV1 = (() => {
+		const d = createDefaultUiPrefs() as StoredUiPrefsV1;
+		if (!browser) return d;
+		try {
+			return (readUiPrefs(localStorage) ?? d) as StoredUiPrefsV1;
+		} catch {
+			return d;
+		}
+	})();
+
 	type Profile = {
 		id: string;
 		name: string;
@@ -281,6 +296,7 @@
 
 	const COMPARE_CURRENT_TARGET_ID = '__current';
 	const COMPARE_MAX_TARGETS = 6;
+	const COMPARE_SLOT_INDEXES = Array.from({ length: COMPARE_MAX_TARGETS }, (_, i) => i);
 
 	const LEFT_SIDEBAR_MIN_PX = 240;
 	const LEFT_SIDEBAR_MAX_PX = 520;
@@ -317,15 +333,7 @@
 	}
 
 	function normalizeCompareTargetIds(raw: string[]): string[] {
-		const out: string[] = [];
-		for (const it of raw) {
-			const s = typeof it === 'string' ? it.trim() : '';
-			if (!s) continue;
-			if (out.includes(s)) continue;
-			out.push(s);
-			if (out.length >= COMPARE_MAX_TARGETS) break;
-		}
-		return out.length ? out : [COMPARE_CURRENT_TARGET_ID];
+		return normalizeCompareTargetIdsPure(raw, { maxTargets: COMPARE_MAX_TARGETS });
 	}
 
 	function safeComparePricingById(v: unknown): Record<string, CompareTargetPricing> {
@@ -489,10 +497,9 @@
 	let error = $state<string | null>(null);
 
 	let settingsHydrated = $state(false);
-	let uiPrefsHydrated = $state(false);
-	let uiColorScheme = $state<UiColorScheme>('system');
-	let uiFontSize = $state<UiFontSize>('md');
-	let uiDensity = $state<UiDensity>('comfortable');
+	let uiColorScheme = $state<UiColorScheme>(INITIAL_UI_PREFS.colorScheme);
+	let uiFontSize = $state<UiFontSize>(INITIAL_UI_PREFS.fontSize);
+	let uiDensity = $state<UiDensity>(INITIAL_UI_PREFS.density);
 	let uiSaveTimer: number | null = null;
 
 	let isDesktop = $state(true);
@@ -544,6 +551,15 @@
 	let stickToBottom = $state(true);
 	const MAX_RENDER_MESSAGES = 200;
 	let renderAllMessages = $state(false);
+
+	const EMPTY_STATE_CHIPS = [
+		{ label: '解释代码', text: '请解释下面这段代码，并指出潜在问题：\n\n```ts\n// 粘贴代码\n```' },
+		{ label: '写单元测试', text: '为下面这段函数写 node --test 单元测试（覆盖边界条件）：\n\n```js\n// 粘贴代码\n```' },
+		{ label: '总结要点', text: '请把下面内容总结为 5 条要点：\n\n' },
+		{ label: '翻译润色', text: '把下面内容翻译成英文，并保持专业语气：\n\n' },
+		{ label: '设计接口', text: '根据需求描述，给出 API 设计（路由、请求/响应、错误码）：\n\n' },
+		{ label: '生成 SQL', text: '根据表结构与需求，写一条 SQL 查询：\n\n' }
+	] as const;
 
 	let abortController: AbortController | null = null;
 
@@ -1115,6 +1131,12 @@
 		}
 
 		cancelRenameConversation();
+	}
+
+	function closeClosestDetails(target: EventTarget | null) {
+		if (!(target instanceof Element)) return;
+		const details = target.closest('details');
+		if (details instanceof HTMLDetailsElement) details.open = false;
 	}
 
 	function duplicateConversation(id: string) {
@@ -2131,22 +2153,6 @@
 	}
 
 	onMount(() => {
-		// UI 偏好（主题/字号/密度）：首屏已在 app.html 中抢先应用，这里用于同步到状态并兜底
-		try {
-			const savedUi = readUiPrefs(localStorage);
-			const ui = (savedUi ?? createDefaultUiPrefs()) as StoredUiPrefsV1;
-			uiColorScheme = ui.colorScheme;
-			uiFontSize = ui.fontSize;
-			uiDensity = ui.density;
-			applyUiPrefsToRoot(document.documentElement, ui);
-		} catch {
-			const ui = createDefaultUiPrefs() as StoredUiPrefsV1;
-			uiColorScheme = ui.colorScheme;
-			uiFontSize = ui.fontSize;
-			uiDensity = ui.density;
-		}
-		uiPrefsHydrated = true;
-
 		let desktopMql: MediaQueryList | null = null;
 		let desktopMqlListener: (() => void) | null = null;
 		try {
@@ -2377,7 +2383,7 @@
 	});
 
 	$effect(() => {
-		if (!uiPrefsHydrated) return;
+		if (!browser) return;
 
 		uiColorScheme;
 		uiFontSize;
@@ -2391,7 +2397,13 @@
 		}
 
 		if (uiSaveTimer) window.clearTimeout(uiSaveTimer);
-		uiSaveTimer = window.setTimeout(() => writeUiPrefs(localStorage, prefs), 150);
+		uiSaveTimer = window.setTimeout(() => {
+			try {
+				writeUiPrefs(localStorage, prefs);
+			} catch {
+				// localStorage 可能被禁用（隐私模式/策略）
+			}
+		}, 150);
 	});
 
 	function fmtTime(ts: number) {
@@ -2708,6 +2720,33 @@
 		return true;
 	}
 
+	function fmtCompareTargetMeta(providerValue: Provider, modelValue: string) {
+		const prov = providerValue === 'openai' ? 'OpenAI' : 'Anthropic';
+		const m = safeString(modelValue, '').trim();
+		return `${prov} · ${m || '—'}`;
+	}
+
+	function isCompareTargetKeyReady(id: string) {
+		const secret = ensureCompareSecret(id);
+		if (id === COMPARE_CURRENT_TARGET_ID) return !!(secret.apiKey || apiKey).trim();
+		return !!secret.apiKey.trim();
+	}
+
+	function getCompareReadiness() {
+		const targets = buildCompareTargets();
+		const issues: string[] = [];
+
+		if (targets.length < 2) issues.push('至少选择 2 个目标');
+
+		for (const t of targets) {
+			if (!t.run.baseUrl.trim()) issues.push(`「${t.name}」缺 Base URL`);
+			if (!t.apiKey.trim()) issues.push(`「${t.name}」缺 API Key`);
+			if (!t.run.model.trim()) issues.push(`「${t.name}」缺 model`);
+		}
+
+		return { targetCount: targets.length, issues };
+	}
+
 	async function runCompare() {
 		notice = null;
 		error = null;
@@ -2897,18 +2936,16 @@
 	}
 
 	function toggleCompareTarget(id: string, checked: boolean) {
+		const normalizedId = typeof id === 'string' ? id.trim() : '';
+		if (!normalizedId) return;
+
 		const current = normalizeCompareTargetIds(compareTargetIds);
-		if (checked) {
-			if (current.includes(id)) return;
-			if (current.length >= COMPARE_MAX_TARGETS) {
-				showNotice(`最多只能选择 ${COMPARE_MAX_TARGETS} 个对比目标`);
-				return;
-			}
-			compareTargetIds = normalizeCompareTargetIds([...current, id]);
+		if (checked && !current.includes(normalizedId) && current.length >= COMPARE_MAX_TARGETS) {
+			showNotice(`最多只能选择 ${COMPARE_MAX_TARGETS} 个对比目标`);
 			return;
 		}
 
-		compareTargetIds = normalizeCompareTargetIds(current.filter((it) => it !== id));
+		compareTargetIds = toggleCompareTargetId(current, normalizedId, checked, { maxTargets: COMPARE_MAX_TARGETS });
 	}
 
 	function clearCompareResults() {
@@ -3327,35 +3364,94 @@
 									{:else}
 										<button class="conv-select" type="button" onclick={() => selectConversation(c.id)} disabled={streaming}>
 											<div class="conv-title-row">
-												<strong class="conv-title">{c.title}</strong>
-												<span class="conv-time">{fmtTime(c.updatedAt)}</span>
+												<strong
+													class="conv-title"
+													ondblclick={(e) => {
+														e.preventDefault();
+														e.stopPropagation();
+														startRenameConversation(c.id);
+													}}
+												>
+													{c.title}
+												</strong>
+												<span class="conv-time" title={new Date(c.updatedAt).toLocaleString()}>{formatRelativeTime(c.updatedAt)}</span>
 											</div>
 											<div class="conv-snippet" class:muted={!c.lastSnippet}>{c.lastSnippet || '（空）'}</div>
 										</button>
 									{/if}
 								</div>
-								<div class="conv-actions-row">
-									<button class="btn btn-sm" type="button" onclick={() => startRenameConversation(c.id)} disabled={streaming}>
-										改名
-									</button>
-									<button class="btn btn-sm" type="button" onclick={() => duplicateConversation(c.id)} disabled={streaming}>
-										复制
-									</button>
-									<button class="btn btn-sm" type="button" onclick={() => exportConversationJson(c.id)} disabled={streaming}>
-										JSON
-									</button>
-									<button
-										class="btn btn-sm"
-										type="button"
-										onclick={() => exportConversationMarkdown(c.id)}
-										disabled={streaming}
-									>
-										MD
-									</button>
-									<button class="btn btn-sm danger" type="button" onclick={() => deleteConversation(c.id)} disabled={streaming}>
-										删除
-									</button>
-								</div>
+
+								{#if editingConversationId !== c.id}
+									<details class="conv-menu">
+										<summary class="btn-icon btn-icon-secondary conv-menu-trigger" aria-label="更多操作" title="更多操作">
+											⋯
+										</summary>
+										<div class="conv-menu-popover" role="menu">
+											<button
+												class="conv-menu-item"
+												type="button"
+												role="menuitem"
+												onclick={(e) => {
+													closeClosestDetails(e.currentTarget);
+													startRenameConversation(c.id);
+												}}
+												disabled={streaming}
+											>
+												改名
+											</button>
+											<button
+												class="conv-menu-item"
+												type="button"
+												role="menuitem"
+												onclick={(e) => {
+													closeClosestDetails(e.currentTarget);
+													duplicateConversation(c.id);
+												}}
+												disabled={streaming}
+											>
+												复制
+											</button>
+											<div class="conv-menu-sep" role="separator"></div>
+											<button
+												class="conv-menu-item"
+												type="button"
+												role="menuitem"
+												onclick={(e) => {
+													closeClosestDetails(e.currentTarget);
+													exportConversationJson(c.id);
+												}}
+												disabled={streaming}
+											>
+												导出 JSON
+											</button>
+											<button
+												class="conv-menu-item"
+												type="button"
+												role="menuitem"
+												onclick={(e) => {
+													closeClosestDetails(e.currentTarget);
+													exportConversationMarkdown(c.id);
+												}}
+												disabled={streaming}
+											>
+												导出 MD
+											</button>
+											<div class="conv-menu-sep" role="separator"></div>
+											<button
+												class="conv-menu-item danger"
+												type="button"
+												role="menuitem"
+												onclick={(e) => {
+													closeClosestDetails(e.currentTarget);
+													deleteConversation(c.id);
+												}}
+												disabled={streaming}
+											>
+												删除
+											</button>
+										</div>
+									</details>
+								{/if}
 							</div>
 						{/each}
 					</div>
@@ -3431,11 +3527,17 @@
 				{#if messages.length === 0}
 					<div class="msg system-intro">
 						<div class="logo">EdgeAI</div>
-						<p>
-							1) 在右侧面板填写 Base URL / Key / Model（手机请点右上角“设置”）<br />
-							2) 在下方输入问题，点击发送<br />
-							3) 如出现 504，多数是上游首包太慢或被阻断；请检查网络、模型与 Base URL
-						</p>
+						<div class="intro-copy">
+							<p class="intro-lead">先把右侧的 Base URL / Key / Model 填好，再在下方提问。</p>
+							<p class="intro-sub">小贴士：Enter 发送，Shift+Enter 换行；如遇 504，多数是上游首包太慢或被阻断。</p>
+						</div>
+						<div class="intro-chips" aria-label="快捷指令">
+							{#each EMPTY_STATE_CHIPS as chip (chip.label)}
+								<button class="pill chip" type="button" onclick={() => insertPromptText(chip.text)} disabled={streaming}>
+									{chip.label}
+								</button>
+							{/each}
+						</div>
 					</div>
 				{/if}
 
@@ -3713,6 +3815,18 @@
 								<line x1="10" y1="9" x2="8" y2="9" />
 							</svg>
 						</button>
+						{#if compareMode}
+							{@const readiness = getCompareReadiness()}
+							<span
+								class="pill composer-compare-pill"
+								class:ok={readiness.issues.length === 0}
+								title={readiness.issues.length
+									? `对比模式未就绪：${readiness.issues.join('；')}`
+									: `对比模式：将并行运行 ${readiness.targetCount} 个目标`}
+							>
+								{readiness.issues.length === 0 ? `对比 ${readiness.targetCount}` : `对比 ${readiness.targetCount}（未就绪）`}
+							</span>
+						{/if}
 						<button class="btn-icon" type="button" onclick={send} disabled={streaming || !prompt.trim()} aria-label="发送">
 							<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
 						</button>
@@ -3955,6 +4069,9 @@
 							spellcheck="false"
 						/>
 					</div>
+					{#if !apiKey.trim()}
+						<div class="alert alert-warning">API Key 缺失：仅用于当前会话，不会落盘；如上游无需 Key 可忽略。</div>
+					{/if}
 
 						<div class="field">
 							<label for="model">模型</label>
@@ -4016,10 +4133,16 @@
 					</div>
 
 					{#if compareMode}
+						{@const selectedCount = normalizeCompareTargetIds(compareTargetIds).length}
+						{@const readiness = getCompareReadiness()}
 						<div class="field">
 							<div class="label-row">
 								<span class="muted">对比目标</span>
-								<span class="muted">{normalizeCompareTargetIds(compareTargetIds).length}/{COMPARE_MAX_TARGETS}</span>
+								<span class="compare-slots" aria-label={`已选择 ${selectedCount}/${COMPARE_MAX_TARGETS}`} title={`${selectedCount}/${COMPARE_MAX_TARGETS}`}>
+									{#each COMPARE_SLOT_INDEXES as slot (slot)}
+										<span class="compare-slot" class:filled={slot < selectedCount}></span>
+									{/each}
+								</span>
 							</div>
 
 							<div class="compare-targets">
@@ -4031,7 +4154,11 @@
 											toggleCompareTarget(COMPARE_CURRENT_TARGET_ID, (e.currentTarget as HTMLInputElement).checked)}
 										disabled={streaming}
 									/>
-									<span>当前设置</span>
+									<span class="compare-target-name">当前设置</span>
+									<span class="muted mono compare-target-meta">{fmtCompareTargetMeta(provider, model)}</span>
+									{#if isCompareTargetSelected(COMPARE_CURRENT_TARGET_ID) && !isCompareTargetKeyReady(COMPARE_CURRENT_TARGET_ID)}
+										<span class="pill danger">Key 缺失</span>
+									{/if}
 								</label>
 
 								{#each profiles as p (p.id)}
@@ -4043,12 +4170,18 @@
 											disabled={streaming}
 										/>
 										<span class="compare-target-name">{p.name}</span>
-										<span class="muted mono">{p.provider === 'openai' ? 'OpenAI' : 'Anthropic'}</span>
+										<span class="muted mono compare-target-meta">{fmtCompareTargetMeta(p.provider, p.model)}</span>
+										{#if isCompareTargetSelected(p.id) && !isCompareTargetKeyReady(p.id)}
+											<span class="pill danger">Key 缺失</span>
+										{/if}
 									</label>
 								{/each}
 							</div>
 
 							<div class="muted">提示：至少选择 2 个目标；API Key 不会落盘。</div>
+							{#if readiness.issues.length}
+								<div class="alert alert-warning">未就绪：{readiness.issues.join('；')}</div>
+							{/if}
 						</div>
 
 						<div class="field">
@@ -4058,154 +4191,206 @@
 							</label>
 						</div>
 
+						{@const compareTargets = buildCompareTargets()}
 						<div class="compare-secrets">
-							{#each buildCompareTargets() as t (t.id)}
-								<details class="compare-secret">
-									<summary>
-										<span class="mono">{t.name}</span>
-										<span class="muted">{t.run.provider === 'openai' ? 'OpenAI' : 'Anthropic'}</span>
-									</summary>
+							{#if compareTargets.length === 0}
+								<div class="muted">选择目标后在此填写 API Key（不落盘）。</div>
+							{:else}
+								{#each compareTargets as t (t.id)}
+									<details class="compare-secret">
+										<summary>
+											<span class="compare-secret-left">
+												<span class="mono">{t.name}</span>
+												<span class="muted mono">{t.run.model.trim() || '—'}</span>
+											</span>
+											<span class="compare-secret-right">
+												<span class="pill">{t.run.provider === 'openai' ? 'OpenAI' : 'Anthropic'}</span>
+												{#if !t.apiKey.trim()}
+													<span class="pill danger">Key 缺失</span>
+												{/if}
+											</span>
+										</summary>
 
-									<div class="field">
-										<label for={"compare-key-" + t.id}>API Key</label>
-										<input
-											id={"compare-key-" + t.id}
-											type="password"
-											value={ensureCompareSecret(t.id).apiKey}
-											placeholder={t.id === COMPARE_CURRENT_TARGET_ID ? '留空则使用上方 API Key' : 'sk-...'}
-											disabled={streaming}
-											autocapitalize="off"
-											autocomplete="off"
-											spellcheck="false"
-											oninput={(e) => setCompareSecret(t.id, { apiKey: (e.currentTarget as HTMLInputElement).value })}
-										/>
-									</div>
-
-									{#if compareEstimateCost}
-										<div class="compare-price-grid">
-											<div class="field">
-												<label for={"compare-in-" + t.id}>输入 $/1M</label>
-												<input
-													id={"compare-in-" + t.id}
-													type="number"
-													min="0"
-													step="0.01"
-													value={ensureCompareSecret(t.id).inputUsdPer1M}
-													disabled={streaming}
-													oninput={(e) =>
-														setCompareSecret(t.id, {
-															inputUsdPer1M: Number((e.currentTarget as HTMLInputElement).value)
-														})}
-												/>
-											</div>
-											<div class="field">
-												<label for={"compare-out-" + t.id}>输出 $/1M</label>
-												<input
-													id={"compare-out-" + t.id}
-													type="number"
-													min="0"
-													step="0.01"
-													value={ensureCompareSecret(t.id).outputUsdPer1M}
-													disabled={streaming}
-													oninput={(e) =>
-														setCompareSecret(t.id, {
-															outputUsdPer1M: Number((e.currentTarget as HTMLInputElement).value)
-														})}
-												/>
-											</div>
+										<div class="field">
+											<label for={"compare-key-" + t.id}>API Key</label>
+											<input
+												id={"compare-key-" + t.id}
+												type="password"
+												value={ensureCompareSecret(t.id).apiKey}
+												placeholder={t.id === COMPARE_CURRENT_TARGET_ID ? '留空则使用上方 API Key' : 'sk-...'}
+												disabled={streaming}
+												autocapitalize="off"
+												autocomplete="off"
+												spellcheck="false"
+												oninput={(e) =>
+													setCompareSecret(t.id, { apiKey: (e.currentTarget as HTMLInputElement).value })}
+											/>
 										</div>
-									{/if}
-								</details>
-							{/each}
+
+										{#if compareEstimateCost}
+											<div class="compare-price-grid">
+												<div class="field">
+													<label for={"compare-in-" + t.id}>输入 $/1M</label>
+													<input
+														id={"compare-in-" + t.id}
+														type="number"
+														min="0"
+														step="0.01"
+														value={ensureCompareSecret(t.id).inputUsdPer1M}
+														disabled={streaming}
+														oninput={(e) =>
+															setCompareSecret(t.id, {
+																inputUsdPer1M: Number((e.currentTarget as HTMLInputElement).value)
+															})}
+													/>
+												</div>
+												<div class="field">
+													<label for={"compare-out-" + t.id}>输出 $/1M</label>
+													<input
+														id={"compare-out-" + t.id}
+														type="number"
+														min="0"
+														step="0.01"
+														value={ensureCompareSecret(t.id).outputUsdPer1M}
+														disabled={streaming}
+														oninput={(e) =>
+															setCompareSecret(t.id, {
+																outputUsdPer1M: Number((e.currentTarget as HTMLInputElement).value)
+															})}
+													/>
+												</div>
+											</div>
+										{/if}
+									</details>
+								{/each}
+							{/if}
 						</div>
 					{/if}
 				</div>
 
-				<div class="field-group">
-					<div class="field">
-						<div class="label-row">
-							<label for="temperature">Temperature（温度）</label>
-							<span class="val">{temperature}</span>
+				<details class="settings-accordion">
+					<summary>
+						<span>高级参数</span>
+						<span class="muted">Temperature / top_p / penalties / max_tokens</span>
+					</summary>
+					<div class="settings-accordion-body">
+						<div class="field slider-field">
+							<div class="slider-row">
+								<label for="temperature">Temperature（温度）</label>
+								<input
+									id="temperature"
+									type="range"
+									min="0"
+									max="2"
+									step="0.1"
+									bind:value={temperature}
+									disabled={streaming || provider !== 'openai'}
+								/>
+								<input
+									class="slider-num mono"
+									type="number"
+									min="0"
+									max="2"
+									step="0.1"
+									bind:value={temperature}
+									disabled={streaming || provider !== 'openai'}
+								/>
+							</div>
 						</div>
-						<input
-							id="temperature"
-							type="range"
-							min="0"
-							max="2"
-							step="0.1"
-							bind:value={temperature}
-							disabled={streaming || provider !== 'openai'}
-						/>
-					</div>
 
-					<div class="field">
-						<div class="label-row">
-							<label for="topP">top_p（核采样）</label>
-							<span class="val">{topP}</span>
+						<div class="field slider-field">
+							<div class="slider-row">
+								<label for="topP">top_p（核采样）</label>
+								<input
+									id="topP"
+									type="range"
+									min="0"
+									max="1"
+									step="0.01"
+									bind:value={topP}
+									disabled={streaming || provider !== 'openai'}
+								/>
+								<input
+									class="slider-num mono"
+									type="number"
+									min="0"
+									max="1"
+									step="0.01"
+									bind:value={topP}
+									disabled={streaming || provider !== 'openai'}
+								/>
+							</div>
 						</div>
-						<input
-							id="topP"
-							type="range"
-							min="0"
-							max="1"
-							step="0.01"
-							bind:value={topP}
-							disabled={streaming || provider !== 'openai'}
-						/>
-					</div>
 
-					<div class="field">
-						<div class="label-row">
-							<label for="presencePenalty">presence_penalty（存在惩罚）</label>
-							<span class="val">{presencePenalty}</span>
+						<div class="field slider-field">
+							<div class="slider-row">
+								<label for="presencePenalty">presence_penalty（存在惩罚）</label>
+								<input
+									id="presencePenalty"
+									type="range"
+									min="-2"
+									max="2"
+									step="0.1"
+									bind:value={presencePenalty}
+									disabled={streaming || provider !== 'openai'}
+								/>
+								<input
+									class="slider-num mono"
+									type="number"
+									min="-2"
+									max="2"
+									step="0.1"
+									bind:value={presencePenalty}
+									disabled={streaming || provider !== 'openai'}
+								/>
+							</div>
 						</div>
-						<input
-							id="presencePenalty"
-							type="range"
-							min="-2"
-							max="2"
-							step="0.1"
-							bind:value={presencePenalty}
-							disabled={streaming || provider !== 'openai'}
-						/>
-					</div>
 
-					<div class="field">
-						<div class="label-row">
-							<label for="frequencyPenalty">frequency_penalty（频率惩罚）</label>
-							<span class="val">{frequencyPenalty}</span>
+						<div class="field slider-field">
+							<div class="slider-row">
+								<label for="frequencyPenalty">frequency_penalty（频率惩罚）</label>
+								<input
+									id="frequencyPenalty"
+									type="range"
+									min="-2"
+									max="2"
+									step="0.1"
+									bind:value={frequencyPenalty}
+									disabled={streaming || provider !== 'openai'}
+								/>
+								<input
+									class="slider-num mono"
+									type="number"
+									min="-2"
+									max="2"
+									step="0.1"
+									bind:value={frequencyPenalty}
+									disabled={streaming || provider !== 'openai'}
+								/>
+							</div>
 						</div>
-						<input
-							id="frequencyPenalty"
-							type="range"
-							min="-2"
-							max="2"
-							step="0.1"
-							bind:value={frequencyPenalty}
-							disabled={streaming || provider !== 'openai'}
-						/>
-					</div>
 
-					<div class="field">
-						<label for="maxTokens">最大输出 tokens</label>
-						<input id="maxTokens" type="number" min="1" step="1" bind:value={maxTokens} disabled={streaming} />
-					</div>
-
-					{#if provider === 'anthropic'}
 						<div class="field">
-							<label for="anthropicVersion">版本</label>
-							<input
-								id="anthropicVersion"
-								bind:value={anthropicVersion}
-								placeholder="2023-06-01"
-								disabled={streaming}
-								autocapitalize="off"
-								autocomplete="off"
-								spellcheck="false"
-							/>
+							<label for="maxTokens">最大输出 tokens</label>
+							<input id="maxTokens" type="number" min="1" step="1" bind:value={maxTokens} disabled={streaming} />
 						</div>
-					{/if}
-				</div>
+
+						{#if provider === 'anthropic'}
+							<div class="field">
+								<label for="anthropicVersion">版本</label>
+								<input
+									id="anthropicVersion"
+									bind:value={anthropicVersion}
+									placeholder="2023-06-01"
+									disabled={streaming}
+									autocapitalize="off"
+									autocomplete="off"
+									spellcheck="false"
+								/>
+							</div>
+						{/if}
+					</div>
+				</details>
 
 				<div class="actions">
 					<button class="btn danger full" type="button" onclick={stop} disabled={!streaming}>停止</button>
