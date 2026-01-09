@@ -3486,11 +3486,6 @@
 			<div class="chat-header">
 				<div class="chat-title">
 					<h1>EdgeAI Playground</h1>
-					<p>
-						同域 `/api/chat` 由 ESA Edge Function 代理转发并流式回传（SSE）。<span class="nowrap"
-							>最后事件：{lastEvent ?? '—'}</span
-						>
-					</p>
 				</div>
 				<div class="chat-actions">
 					<button
@@ -3895,7 +3890,7 @@
 						</div>
 
 						{#if profiles.length === 0}
-							<div class="muted">暂无 Profile。可先配置右侧参数，然后点击下方“保存”创建。</div>
+							<div class="muted">暂无 Profile。可先配置下方参数，然后点击“保存”创建。</div>
 						{:else}
 							<div class="profile-list">
 								{#each profiles as p (p.id)}
