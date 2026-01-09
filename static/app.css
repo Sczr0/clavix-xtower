@@ -1332,7 +1332,8 @@ button.link:hover {
 	border: none;
 	background: transparent;
 	color: inherit;
-	padding: calc(12px * var(--ui-density)) calc(12px * var(--ui-density)) calc(10px * var(--ui-density));
+	padding: calc(12px * var(--ui-density)) calc(36px + 16px * var(--ui-density)) calc(10px * var(--ui-density))
+		calc(12px * var(--ui-density));
 	cursor: pointer;
 	display: flex;
 	flex-direction: column;
@@ -1350,7 +1351,6 @@ button.link:hover {
 	justify-content: space-between;
 	gap: calc(10px * var(--ui-density));
 	min-width: 0;
-	padding-right: calc(28px * var(--ui-density));
 }
 
 .conv-title {
