@@ -2,6 +2,9 @@
 
 一个“边缘 AI 调试台”：前端用 SvelteKit（静态站点），后端用阿里云 ESA（Functions and Pages）的 Edge Function 作为代理转发层，支持流式对话（SSE）。
 
+本项目由阿里云ESA提供加速、计算和保护
+![alt text](image.png)
+
 ## 功能
 
 - OpenAI Compatible（`/v1/chat/completions`）与 Anthropic（`/v1/messages`）上游代理与流式回传（SSE）
